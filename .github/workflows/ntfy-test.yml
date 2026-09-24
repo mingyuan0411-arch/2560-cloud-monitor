@@ -1,0 +1,19 @@
+name: ntfy 推播測試
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 發送測試通知
+        env:
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_SERVER: ${{ secrets.NTFY_SERVER }}
+        run: |
+          curl -H "Title: 2560 推播測試" \
+               -H "Priority: high" \
+               -d "如果你看到這則通知，代表 GitHub 雲端 → ntfy → 手機 已經全部接通。" \
+               "$NTFY_SERVER/$NTFY_TOPIC"
