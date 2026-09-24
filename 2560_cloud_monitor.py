@@ -1,25 +1,44 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-2560 Cloud Monitor — Frozen Strict v1
-GitHub Actions + ntfy
--------------------------------------
-- Gate USDT perpetual public candles
-- No API key
-- No order placement
-- Uses completed 4H + completed 1D candles only
-- Sends ntfy notification only when the latest completed 4H candle itself is STRICT
+2560 Cloud Monitor — Expanded Pool v2
+=====================================
+Validated benchmark group:
+BTC / ETH / XRP / SOL / BNB
+
+Extended monitoring group:
+ADA / LTC / LINK / DOGE / SUI / HYPE
+MU / VRT / DELL / NVDA / TSM / BRKB
+
+Rules:
+4H CORE
+- MA25 rising
+- Close > MA25
+- VolMA5 crosses above VolMA60
+
+1D confirmation
+- Close > MA25
+- MA25 rising
+- VolMA5 > VolMA60
+
+20-bar dedup per contract.
+Completed candles only.
+No API key. No orders.
 """
 
 import json
 import os
+import re
 import time
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
 BASE = "https://api.gateio.ws/api/v4"
-SYMBOLS = ["BTC_USDT","ETH_USDT","XRP_USDT","SOL_USDT","BNB_USDT"]
+
+VALIDATED = ["BTC","ETH","XRP","SOL","BNB"]
+EXTENDED = ["ADA","LTC","LINK","DOGE","SUI","HYPE","MU","VRT","DELL","NVDA","TSM","BRKB"]
+REQUESTED = VALIDATED + EXTENDED
 
 FOUR_H = 4 * 3600
 ONE_D = 24 * 3600
@@ -30,26 +49,48 @@ DEDUP_BARS = 20
 NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
 NTFY_TOPIC = os.getenv("NTFY_TOPIC", "").strip()
 
-def gate_get(path, params, retries=5):
+def gate_get(path, params=None, retries=5):
+    params = params or {}
     qs = urllib.parse.urlencode(params)
-    url = BASE + path + "?" + qs
+    url = BASE + path + (("?" + qs) if qs else "")
     last = None
     for k in range(retries):
         try:
             req = urllib.request.Request(
                 url,
-                headers={"Accept":"application/json","User-Agent":"2560-cloud-monitor/1.0"}
+                headers={"Accept":"application/json","User-Agent":"2560-cloud-monitor/2.0"}
             )
-            with urllib.request.urlopen(req, timeout=25) as r:
+            with urllib.request.urlopen(req, timeout=30) as r:
                 return json.load(r)
         except Exception as e:
             last = e
             time.sleep(min(2**k, 8))
     raise RuntimeError(f"Gate request failed: {last}")
 
-def fetch(symbol, interval, limit):
+def norm(s):
+    return re.sub(r"[^A-Z0-9]", "", s.upper())
+
+def discover_contracts():
+    data = gate_get("/futures/usdt/contracts")
+    names = [x.get("name","") for x in data if x.get("name")]
+    mapping = {}
+    for base in REQUESTED:
+        target = norm(base + "USDT")
+        exact = [n for n in names if norm(n) == target]
+        if exact:
+            mapping[base] = exact[0]
+            continue
+        candidates = []
+        for n in names:
+            nn = norm(n)
+            if nn.endswith("USDT") and nn[:-4] == norm(base):
+                candidates.append(n)
+        mapping[base] = candidates[0] if candidates else None
+    return mapping
+
+def fetch(contract, interval, limit):
     raw = gate_get("/futures/usdt/candlesticks", {
-        "contract": symbol,
+        "contract": contract,
         "interval": interval,
         "limit": limit,
     })
@@ -123,16 +164,15 @@ def last_completed_daily_asof(daily, close_t):
     return ans
 
 def strict_raw_at(r4, rd):
-    d = last_completed_daily_asof(rd, r4["close_t"])
+    d=last_completed_daily_asof(rd,r4["close_t"])
     return core_ok(r4) and daily_ok(d), d
 
 def kept_strict(r4, rd):
     raw=[]
     for r in r4:
-        ok,_ = strict_raw_at(r, rd)
+        ok,_=strict_raw_at(r,rd)
         if ok:
             raw.append(r)
-
     kept=[]
     last_i=-10**9
     for r in raw:
@@ -144,24 +184,26 @@ def kept_strict(r4, rd):
 def iso(ts):
     return datetime.fromtimestamp(ts,timezone.utc).isoformat()
 
-def analyze(symbol):
+def analyze(base_symbol, contract):
     now=int(datetime.now(timezone.utc).timestamp())
-    r4=completed_only(fetch(symbol,"4h",LIMIT_4H),FOUR_H,now)
-    rd=completed_only(fetch(symbol,"1d",LIMIT_1D),ONE_D,now)
+    r4=completed_only(fetch(contract,"4h",LIMIT_4H),FOUR_H,now)
+    rd=completed_only(fetch(contract,"1d",LIMIT_1D),ONE_D,now)
 
     if len(r4)<65 or len(rd)<65:
-        raise RuntimeError(f"insufficient candles 4h={len(r4)} 1d={len(rd)}")
+        raise RuntimeError(f"insufficient candles: 4h={len(r4)} 1d={len(rd)}")
 
     add_ind(r4,FOUR_H)
     add_ind(rd,ONE_D)
 
     latest=r4[-1]
-    raw_now,d= strict_raw_at(latest,rd)
+    raw_now,d=strict_raw_at(latest,rd)
     kept=kept_strict(r4,rd)
-    strict_now=bool(kept and kept[-1]["t"]==latest["t"])
+    strict_now=bool(kept and kept[-1]["t"] == latest["t"])
 
     return {
-        "symbol":symbol,
+        "base":base_symbol,
+        "contract":contract,
+        "group":"VALIDATED" if base_symbol in VALIDATED else "EXTENDED",
         "latest_4h_open_utc":iso(latest["t"]),
         "latest_4h_close_utc":iso(latest["close_t"]),
         "latest_close":latest["c"],
@@ -176,56 +218,83 @@ def notify_ntfy(r):
         print("NTFY_TOPIC not set; notification skipped.")
         return
 
-    title=f"2560 STRICT {r['symbol']}"
+    label = "已驗證組" if r["group"]=="VALIDATED" else "擴充監控組"
+    title=f"2560 STRICT {r['base']}"
     msg=(
-        f"{r['symbol']} 出現新的 2560 Strict 多頭訊號\n"
+        f"{r['base']} 出現新的 2560 Strict 多頭訊號\n"
+        f"組別: {label}\n"
+        f"Gate contract: {r['contract']}\n"
         f"4H: {r['latest_4h_open_utc']}\n"
         f"Close: {r['latest_close']}\n"
         f"4H CORE: {r['4h_core']} | 1D: {r['1d_confirm']}"
     )
 
-    url=f"{NTFY_SERVER}/{NTFY_TOPIC}"
     req=urllib.request.Request(
-        url,
+        f"{NTFY_SERVER}/{NTFY_TOPIC}",
         data=msg.encode("utf-8"),
         method="POST",
         headers={
-            "Title": title,
-            "Priority": "high",
-            "Tags": "chart_with_upwards_trend,bell",
-            "Content-Type": "text/plain; charset=utf-8",
+            "Title":title,
+            "Priority":"high",
+            "Tags":"chart_with_upwards_trend,bell",
+            "Content-Type":"text/plain; charset=utf-8",
         }
     )
     with urllib.request.urlopen(req,timeout=20) as resp:
-        print("ntfy:",resp.status)
+        print("ntfy:",resp.status,r["base"])
 
 def main():
-    print("2560 Cloud Monitor | Frozen Strict v1")
+    print("2560 Cloud Monitor | Expanded Pool v2")
     print(datetime.now(timezone.utc).isoformat())
+
+    contract_map=discover_contracts()
+    print("\nCONTRACT MAP")
+    for base in REQUESTED:
+        print(f"{base:<5} -> {contract_map.get(base)}")
 
     stricts=[]
     results=[]
 
-    for s in SYMBOLS:
+    print("\nSCAN")
+    for base in REQUESTED:
+        contract=contract_map.get(base)
+        if not contract:
+            print(f"{base:<5} NOT_FOUND")
+            results.append({
+                "base":base,
+                "group":"VALIDATED" if base in VALIDATED else "EXTENDED",
+                "status":"NOT_FOUND"
+            })
+            continue
+
         try:
-            r=analyze(s)
+            r=analyze(base,contract)
             results.append(r)
             print(
-                s,
-                "STRICT" if r["strict"] else "NO_SIGNAL",
-                "close=",r["latest_close"],
-                "4H=",r["4h_core"],
-                "1D=",r["1d_confirm"]
+                f"{base:<5} "
+                f"{'STRICT' if r['strict'] else 'NO_SIGNAL':<9} "
+                f"contract={contract:<18} "
+                f"close={r['latest_close']} "
+                f"4H={r['4h_core']} 1D={r['1d_confirm']}"
             )
             if r["strict"]:
                 stricts.append(r)
         except Exception as e:
-            print(s,"ERROR",e)
+            print(f"{base:<5} ERROR {e}")
+            results.append({
+                "base":base,
+                "contract":contract,
+                "group":"VALIDATED" if base in VALIDATED else "EXTENDED",
+                "status":"ERROR",
+                "error":str(e)
+            })
+
+        time.sleep(0.15)
 
     for r in stricts:
         notify_ntfy(r)
 
-    print("STRICT count:",len(stricts))
+    print("\nSTRICT count:",len(stricts))
 
 if __name__=="__main__":
     main()
