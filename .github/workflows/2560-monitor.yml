@@ -2,8 +2,7 @@ name: 2560 Strict Monitor
 
 on:
   schedule:
-    - schedule:
-  - cron: "10 * * * *"
+    - cron: "10 * * * *"
   workflow_dispatch:
 
 jobs:
@@ -12,15 +11,15 @@ jobs:
     timeout-minutes: 10
 
     steps:
-      - name: 取得程式碼
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 設定 Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      - name: 執行 2560 監控
+      - name: Run 2560 monitor
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           NTFY_SERVER: ${{ secrets.NTFY_SERVER }}
