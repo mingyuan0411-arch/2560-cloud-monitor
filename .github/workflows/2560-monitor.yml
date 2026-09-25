@@ -2,15 +2,27 @@ name: 2560 Strict Monitor
 
 on:
   schedule:
-   - cron: "*/10 * * * *"
+    - cron: "*/10 * * * *"
+
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: 2560-cloud-monitor
+  cancel-in-progress: false
+
 jobs:
+
   monitor:
+
     runs-on: ubuntu-latest
+
     timeout-minutes: 10
 
     steps:
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -19,8 +31,24 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Restore monitor state
+        uses: actions/cache/restore@v4
+        with:
+          path: .monitor_state
+          key: 2560-state-${{ github.run_id }}
+          restore-keys: |
+            2560-state-
+
       - name: Run 2560 monitor
         env:
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
-          NTFY_SERVER: ${{ secrets.NTFY_SERVER }}
-        run: python 2560_cloud_monitor.py
+          NTFY_SERVER: https://ntfy.sh
+        run: |
+          python 2560_cloud_monitor.py
+
+      - name: Save monitor state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .monitor_state
+          key: 2560-state-${{ github.run_id }}
