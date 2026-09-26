@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-2560 Cloud Monitor v4.2
+2560 Cloud Monitor v4.3
 =======================
 
 狀態：
@@ -12,7 +12,8 @@ TREND_READY
 PRE-STRICT
 STRICT
 
-STRICT 原版保持不變：
+STRICT 原版規則完全保持不變：
+
 4H CORE
 - MA25 rising
 - Close > MA25
@@ -23,26 +24,21 @@ STRICT 原版保持不變：
 - MA25 rising
 - VolMA5 > VolMA60
 
-20-bar dedup.
+20-bar dedup
 
-新增：
-TREND_READY
-- 1H 多頭
-- 4H early 趨勢成立
-- 4H relaxed volume 成立
-- 1D soft 成立
-
-PRE-STRICT
-- 1H 多頭
-- 4H structure 成立
-- 4H relaxed volume 成立
-- 1D strict confirmation 成立
-
-用途：
-WATCH = 初步候選
-TREND_READY = 趨勢與量能開始成形
-PRE-STRICT = 趨勢、量能、日線已成熟
-STRICT = 原版 2560 正式高標準訊號
+v4.3 新增：
+- WATCH 第一次出現價格 / 時間
+- TREND_READY 第一次出現價格 / 時間
+- PRE-STRICT 第一次出現價格 / 時間
+- STRICT 第一次出現價格 / 時間
+- 最新 5m 完成K價格
+- 各階段 -> 目前 漲跌幅
+- WATCH -> TREND_READY
+- TREND_READY -> PRE-STRICT
+- PRE-STRICT -> STRICT
+- PRE-STRICT -> STRICT 追價幅度
+- NO_SIGNAL 失效通知保留完整階段歷史
+- 新週期開始才清除上一輪價格紀錄
 
 Public Gate data only.
 No API key.
@@ -58,7 +54,6 @@ import urllib.request
 
 from datetime import datetime, timezone
 from pathlib import Path
-from email.header import Header
 
 
 # ============================================================
@@ -92,15 +87,27 @@ EXTENDED = [
 
 REQUESTED = VALIDATED + EXTENDED
 
+
+# ============================================================
+# K線時間
+# ============================================================
+
+FIVE_M = 5 * 60
 ONE_H = 60 * 60
 FOUR_H = 4 * 60 * 60
 ONE_D = 24 * 60 * 60
 
+LIMIT_5M = 10
 LIMIT_1H = 220
 LIMIT_4H = 220
 LIMIT_1D = 120
 
 DEDUP_BARS = 20
+
+
+# ============================================================
+# NTFY
+# ============================================================
 
 NTFY_SERVER = os.getenv(
     "NTFY_SERVER",
@@ -112,15 +119,96 @@ NTFY_TOPIC = os.getenv(
     ""
 ).strip()
 
+
+# ============================================================
+# State
+# ============================================================
+
 STATE_DIR = Path(".monitor_state")
 STATE_FILE = STATE_DIR / "2560_state.json"
+
+
+# ============================================================
+# 基礎工具
+# ============================================================
+
+def now_iso():
+
+    return datetime.now(
+        timezone.utc
+    ).isoformat()
+
+
+def norm(s):
+
+    return re.sub(
+        r"[^A-Z0-9]",
+        "",
+        str(s).upper()
+    )
+
+
+def iso(ts):
+
+    return datetime.fromtimestamp(
+        ts,
+        timezone.utc
+    ).isoformat()
+
+
+def price_text(v):
+
+    if v is None:
+        return "N/A"
+
+    if abs(v) >= 100:
+        return f"{v:.2f}"
+
+    if abs(v) >= 10:
+        return f"{v:.3f}"
+
+    if abs(v) >= 1:
+        return f"{v:.4f}"
+
+    return f"{v:.6f}"
+
+
+def pct_change(
+    start_price,
+    end_price
+):
+
+    if (
+        start_price is None
+        or end_price is None
+        or start_price <= 0
+    ):
+        return None
+
+    return (
+        end_price
+        / start_price
+        - 1
+    ) * 100
+
+
+def pct_text(v):
+
+    if v is None:
+        return "N/A"
+
+    return f"{v:+.2f}%"
 
 
 # ============================================================
 # Gate API
 # ============================================================
 
-def gate_get(path, params=None, retries=5):
+def gate_get(
+    path,
+    params=None,
+    retries=5
+):
 
     params = params or {}
 
@@ -143,7 +231,7 @@ def gate_get(path, params=None, retries=5):
                 url,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "2560-cloud-monitor/4.2",
+                    "User-Agent": "2560-cloud-monitor/4.3",
                 }
             )
 
@@ -174,15 +262,6 @@ def gate_get(path, params=None, retries=5):
 # 合約辨識
 # ============================================================
 
-def norm(s):
-
-    return re.sub(
-        r"[^A-Z0-9]",
-        "",
-        str(s).upper()
-    )
-
-
 def discover_contracts():
 
     data = gate_get(
@@ -203,16 +282,19 @@ def discover_contracts():
     mapping = {}
 
     aliases = {
+
         "BRKB": [
             "BRKB",
             "BRKBG",
             "BRK.B",
         ],
+
         "TSM": [
             "TSM",
             "TSMUS",
         ],
     }
+
 
     for base in REQUESTED:
 
@@ -237,11 +319,16 @@ def discover_contracts():
 
             for item in possible:
 
-                key = norm(item)
+                key = norm(
+                    item
+                )
 
                 if key in normalized_names:
 
-                    found = normalized_names[key]
+                    found = normalized_names[
+                        key
+                    ]
+
                     break
 
             if found:
@@ -417,7 +504,8 @@ def add_indicators(
         )
 
         r["close_t"] = (
-            r["t"] + seconds
+            r["t"]
+            + seconds
         )
 
 
@@ -442,9 +530,13 @@ def one_hour_confirm(r):
 
     return (
         r["c"] > r["ma20"]
+
         and
+
         r["ma5"] > r["ma10"]
+
         and
+
         r["ma10"] > r["ma20"]
     )
 
@@ -463,14 +555,18 @@ def four_hour_structure(r):
         return False
 
     return (
-        r["ma25"] > r["ma25_prev"]
+        r["ma25"]
+        > r["ma25_prev"]
+
         and
-        r["c"] > r["ma25"]
+
+        r["c"]
+        > r["ma25"]
     )
 
 
 # ============================================================
-# 4H early trend
+# 4H Early
 # ============================================================
 
 def four_hour_early(r):
@@ -483,11 +579,13 @@ def four_hour_early(r):
         return False
 
     price_ok = (
-        r["c"] > r["ma25"]
+        r["c"]
+        > r["ma25"]
     )
 
     slope_ok = (
-        r["ma25"] >= r["ma25_prev"]
+        r["ma25"]
+        >= r["ma25_prev"]
     )
 
     return (
@@ -498,9 +596,7 @@ def four_hour_early(r):
 
 
 # ============================================================
-# 4H relaxed volume
-#
-# 不要求「剛好上穿60」
+# 4H Relaxed Volume
 # ============================================================
 
 def relaxed_volume_ok(r):
@@ -556,11 +652,13 @@ def core_ok(r):
         return False
 
     return (
-        r["ma25"] > r["ma25_prev"]
+        r["ma25"]
+        > r["ma25_prev"]
 
         and
 
-        r["c"] > r["ma25"]
+        r["c"]
+        > r["ma25"]
 
         and
 
@@ -575,7 +673,7 @@ def core_ok(r):
 
 
 # ============================================================
-# 1D STRICT
+# 原版 1D STRICT
 # ============================================================
 
 def daily_confirm(r):
@@ -597,20 +695,23 @@ def daily_confirm(r):
         return False
 
     return (
-        r["c"] > r["ma25"]
+        r["c"]
+        > r["ma25"]
 
         and
 
-        r["ma25"] > r["ma25_prev"]
+        r["ma25"]
+        > r["ma25_prev"]
 
         and
 
-        r["vma5"] > r["vma60"]
+        r["vma5"]
+        > r["vma60"]
     )
 
 
 # ============================================================
-# 1D soft
+# 1D Soft
 # ============================================================
 
 def daily_soft_confirm(r):
@@ -642,6 +743,7 @@ def last_completed_daily_asof(
 
         if r["close_t"] <= close_t:
             ans = r
+
         else:
             break
 
@@ -682,35 +784,28 @@ def kept_strict(
             r,
             daily
         ):
+
             raw.append(r)
+
 
     kept = []
 
     last_i = -10**9
 
+
     for r in raw:
 
         if (
-            r["i"] - last_i
+            r["i"]
+            - last_i
             >= DEDUP_BARS
         ):
 
             kept.append(r)
+
             last_i = r["i"]
 
     return kept
-
-
-# ============================================================
-# ISO
-# ============================================================
-
-def iso(ts):
-
-    return datetime.fromtimestamp(
-        ts,
-        timezone.utc
-    ).isoformat()
 
 
 # ============================================================
@@ -728,6 +823,23 @@ def analyze(
         ).timestamp()
     )
 
+
+    # --------------------------------------------------------
+    # 5m 只拿來記錄接近現價
+    # 不參與 2560 訊號
+    # --------------------------------------------------------
+
+    r5 = completed_only(
+        fetch(
+            contract,
+            "5m",
+            LIMIT_5M
+        ),
+        FIVE_M,
+        now_ts
+    )
+
+
     r1 = completed_only(
         fetch(
             contract,
@@ -737,6 +849,7 @@ def analyze(
         ONE_H,
         now_ts
     )
+
 
     r4 = completed_only(
         fetch(
@@ -748,6 +861,7 @@ def analyze(
         now_ts
     )
 
+
     rd = completed_only(
         fetch(
             contract,
@@ -758,7 +872,10 @@ def analyze(
         now_ts
     )
 
+
     if (
+        len(r5) < 1
+        or
         len(r1) < 65
         or
         len(r4) < 65
@@ -767,8 +884,11 @@ def analyze(
     ):
 
         return {
-            "base": base,
-            "contract": contract,
+            "base":
+                base,
+
+            "contract":
+                contract,
 
             "group":
                 "VALIDATED"
@@ -777,6 +897,9 @@ def analyze(
 
             "status":
                 "WAIT_HISTORY",
+
+            "bars_5m":
+                len(r5),
 
             "bars_1h":
                 len(r1),
@@ -787,6 +910,7 @@ def analyze(
             "bars_1d":
                 len(rd),
         }
+
 
     add_indicators(
         r1,
@@ -803,6 +927,9 @@ def analyze(
         ONE_D
     )
 
+
+    latest5 = r5[-1]
+
     latest1 = r1[-1]
     previous1 = r1[-2]
 
@@ -814,6 +941,11 @@ def analyze(
             latest4["close_t"]
         )
     )
+
+
+    # ========================================================
+    # 1H
+    # ========================================================
 
     oneh_now = one_hour_confirm(
         latest1
@@ -828,6 +960,11 @@ def analyze(
         and
         not oneh_prev
     )
+
+
+    # ========================================================
+    # 4H
+    # ========================================================
 
     h4_structure = (
         four_hour_structure(
@@ -851,6 +988,11 @@ def analyze(
         latest4
     )
 
+
+    # ========================================================
+    # 1D
+    # ========================================================
+
     day_strict = daily_confirm(
         latest_d
     )
@@ -858,6 +1000,11 @@ def analyze(
     day_soft = daily_soft_confirm(
         latest_d
     )
+
+
+    # ========================================================
+    # STRICT
+    # ========================================================
 
     strict_raw = (
         h4_core
@@ -872,15 +1019,16 @@ def analyze(
 
     strict_now = (
         bool(strict_kept)
+
         and
+
         strict_kept[-1]["t"]
         == latest4["t"]
     )
 
+
     # ========================================================
     # PRE-STRICT
-    #
-    # 新版要求 VolRelax=True
     # ========================================================
 
     pre_strict = (
@@ -902,6 +1050,7 @@ def analyze(
 
         day_strict
     )
+
 
     # ========================================================
     # TREND_READY
@@ -931,6 +1080,7 @@ def analyze(
         day_soft
     )
 
+
     # ========================================================
     # WATCH
     # ========================================================
@@ -950,6 +1100,7 @@ def analyze(
 
         oneh_now
     )
+
 
     # ========================================================
     # STATUS
@@ -975,12 +1126,24 @@ def analyze(
 
         status = "NO_SIGNAL"
 
+
+    # ========================================================
+    # Volume Ratio
+    # ========================================================
+
     volume_ratio = None
 
     if (
         latest4.get("vma5")
+        is not None
+
         and
+
         latest4.get("vma60")
+        not in (
+            None,
+            0
+        )
     ):
 
         volume_ratio = (
@@ -989,7 +1152,9 @@ def analyze(
             latest4["vma60"]
         )
 
+
     return {
+
         "base":
             base,
 
@@ -1004,8 +1169,16 @@ def analyze(
         "status":
             status,
 
-        "latest_close":
+
+        # 5m 完成K，作為接近現價
+        "current_price":
+            latest5["c"],
+
+
+        # 保留原本 4H close
+        "latest_4h_close":
             latest4["c"],
+
 
         "1h_confirm":
             oneh_now,
@@ -1040,6 +1213,11 @@ def analyze(
         "strict":
             strict_now,
 
+        "latest_5m_open_utc":
+            iso(
+                latest5["t"]
+            ),
+
         "latest_1h_open_utc":
             iso(
                 latest1["t"]
@@ -1071,12 +1249,6 @@ def send_ntfy(
 
         return False
 
-    safe_title = str(
-        Header(
-            title,
-            "utf-8"
-        )
-    )
 
     req = urllib.request.Request(
         f"{NTFY_SERVER}/{NTFY_TOPIC}",
@@ -1086,7 +1258,7 @@ def send_ntfy(
         method="POST",
         headers={
             "Title":
-                safe_title,
+                title,
 
             "Priority":
                 priority,
@@ -1098,6 +1270,7 @@ def send_ntfy(
                 "text/plain; charset=utf-8",
         }
     )
+
 
     try:
 
@@ -1113,6 +1286,7 @@ def send_ntfy(
             )
 
             return True
+
 
     except Exception as e:
 
@@ -1136,11 +1310,13 @@ def load_state():
         exist_ok=True
     )
 
+
     if not STATE_FILE.exists():
 
         return {
             "symbols": {}
         }
+
 
     try:
 
@@ -1149,9 +1325,8 @@ def load_state():
             encoding="utf-8"
         ) as f:
 
-            state = json.load(
-                f
-            )
+            state = json.load(f)
+
 
         state.setdefault(
             "symbols",
@@ -1159,6 +1334,7 @@ def load_state():
         )
 
         return state
+
 
     except Exception as e:
 
@@ -1179,6 +1355,7 @@ def save_state(state):
         exist_ok=True
     )
 
+
     with STATE_FILE.open(
         "w",
         encoding="utf-8"
@@ -1193,6 +1370,476 @@ def save_state(state):
 
 
 # ============================================================
+# 新週期清除
+# ============================================================
+
+def reset_cycle(
+    symbol_state
+):
+
+    keys = [
+
+        "watch_price",
+        "watch_time",
+
+        "trend_ready_price",
+        "trend_ready_time",
+
+        "pre_strict_price",
+        "pre_strict_time",
+
+        "strict_price",
+        "strict_time",
+
+        "current_price",
+        "current_time",
+    ]
+
+
+    for key in keys:
+
+        symbol_state.pop(
+            key,
+            None
+        )
+
+
+# ============================================================
+# 階段價格記憶
+# ============================================================
+
+def update_stage_memory(
+    r,
+    symbol_state,
+    previous
+):
+
+    status = r["status"]
+
+    current_price = r[
+        "current_price"
+    ]
+
+
+    # 每次更新接近現價
+    symbol_state[
+        "current_price"
+    ] = current_price
+
+    symbol_state[
+        "current_time"
+    ] = now_iso()
+
+
+    active_states = (
+        "WATCH",
+        "TREND_READY",
+        "PRE-STRICT",
+        "STRICT",
+    )
+
+
+    # --------------------------------------------------------
+    # 新週期
+    # --------------------------------------------------------
+
+    if (
+        previous
+        in (
+            "NO_SIGNAL",
+            "UNKNOWN"
+        )
+
+        and
+
+        status
+        in active_states
+    ):
+
+        reset_cycle(
+            symbol_state
+        )
+
+        symbol_state[
+            "current_price"
+        ] = current_price
+
+        symbol_state[
+            "current_time"
+        ] = now_iso()
+
+
+    # --------------------------------------------------------
+    # WATCH
+    # --------------------------------------------------------
+
+    if (
+        status == "WATCH"
+
+        and
+
+        symbol_state.get(
+            "watch_price"
+        )
+        is None
+    ):
+
+        symbol_state[
+            "watch_price"
+        ] = current_price
+
+        symbol_state[
+            "watch_time"
+        ] = now_iso()
+
+
+    # --------------------------------------------------------
+    # TREND_READY
+    # --------------------------------------------------------
+
+    if (
+        status == "TREND_READY"
+
+        and
+
+        symbol_state.get(
+            "trend_ready_price"
+        )
+        is None
+    ):
+
+        symbol_state[
+            "trend_ready_price"
+        ] = current_price
+
+        symbol_state[
+            "trend_ready_time"
+        ] = now_iso()
+
+
+    # --------------------------------------------------------
+    # PRE-STRICT
+    # --------------------------------------------------------
+
+    if (
+        status == "PRE-STRICT"
+
+        and
+
+        symbol_state.get(
+            "pre_strict_price"
+        )
+        is None
+    ):
+
+        symbol_state[
+            "pre_strict_price"
+        ] = current_price
+
+        symbol_state[
+            "pre_strict_time"
+        ] = now_iso()
+
+
+    # --------------------------------------------------------
+    # STRICT
+    # --------------------------------------------------------
+
+    if (
+        status == "STRICT"
+
+        and
+
+        symbol_state.get(
+            "strict_price"
+        )
+        is None
+    ):
+
+        symbol_state[
+            "strict_price"
+        ] = current_price
+
+        symbol_state[
+            "strict_time"
+        ] = now_iso()
+
+
+# ============================================================
+# 階段統計
+# ============================================================
+
+def stage_stats(
+    symbol_state
+):
+
+    current = symbol_state.get(
+        "current_price"
+    )
+
+    watch = symbol_state.get(
+        "watch_price"
+    )
+
+    trend = symbol_state.get(
+        "trend_ready_price"
+    )
+
+    pre = symbol_state.get(
+        "pre_strict_price"
+    )
+
+    strict = symbol_state.get(
+        "strict_price"
+    )
+
+
+    return {
+
+        "current":
+            current,
+
+        "watch":
+            watch,
+
+        "trend":
+            trend,
+
+        "pre":
+            pre,
+
+        "strict":
+            strict,
+
+
+        # 各階段 -> 現在
+        "watch_to_now":
+            pct_change(
+                watch,
+                current
+            ),
+
+        "trend_to_now":
+            pct_change(
+                trend,
+                current
+            ),
+
+        "pre_to_now":
+            pct_change(
+                pre,
+                current
+            ),
+
+        "strict_to_now":
+            pct_change(
+                strict,
+                current
+            ),
+
+
+        # 階段之間
+        "watch_to_trend":
+            pct_change(
+                watch,
+                trend
+            ),
+
+        "trend_to_pre":
+            pct_change(
+                trend,
+                pre
+            ),
+
+        "pre_to_strict":
+            pct_change(
+                pre,
+                strict
+            ),
+
+        "watch_to_strict":
+            pct_change(
+                watch,
+                strict
+            ),
+    }
+
+
+# ============================================================
+# 階段價格文字
+# ============================================================
+
+def build_stage_block(
+    symbol_state
+):
+
+    s = stage_stats(
+        symbol_state
+    )
+
+    lines = []
+
+
+    # --------------------------------------------------------
+    # 階段價格
+    # --------------------------------------------------------
+
+    if s["watch"] is not None:
+
+        lines.append(
+            "WATCH："
+            + price_text(
+                s["watch"]
+            )
+        )
+
+
+    if s["trend"] is not None:
+
+        lines.append(
+            "TREND_READY："
+            + price_text(
+                s["trend"]
+            )
+        )
+
+
+    if s["pre"] is not None:
+
+        lines.append(
+            "PRE-STRICT："
+            + price_text(
+                s["pre"]
+            )
+        )
+
+
+    if s["strict"] is not None:
+
+        lines.append(
+            "STRICT："
+            + price_text(
+                s["strict"]
+            )
+        )
+
+
+    lines.append(
+        "目前："
+        + price_text(
+            s["current"]
+        )
+    )
+
+
+    # --------------------------------------------------------
+    # 各階段到目前
+    # --------------------------------------------------------
+
+    movement_lines = []
+
+
+    if s["watch_to_now"] is not None:
+
+        movement_lines.append(
+            "WATCH→目前："
+            + pct_text(
+                s["watch_to_now"]
+            )
+        )
+
+
+    if s["trend_to_now"] is not None:
+
+        movement_lines.append(
+            "TREND_READY→目前："
+            + pct_text(
+                s["trend_to_now"]
+            )
+        )
+
+
+    if s["pre_to_now"] is not None:
+
+        movement_lines.append(
+            "PRE-STRICT→目前："
+            + pct_text(
+                s["pre_to_now"]
+            )
+        )
+
+
+    if s["strict_to_now"] is not None:
+
+        movement_lines.append(
+            "STRICT→目前："
+            + pct_text(
+                s["strict_to_now"]
+            )
+        )
+
+
+    if movement_lines:
+
+        lines.append("")
+
+        lines.extend(
+            movement_lines
+        )
+
+
+    # --------------------------------------------------------
+    # 階段之間
+    # --------------------------------------------------------
+
+    transition_lines = []
+
+
+    if s["watch_to_trend"] is not None:
+
+        transition_lines.append(
+            "WATCH→TREND_READY："
+            + pct_text(
+                s["watch_to_trend"]
+            )
+        )
+
+
+    if s["trend_to_pre"] is not None:
+
+        transition_lines.append(
+            "TREND_READY→PRE-STRICT："
+            + pct_text(
+                s["trend_to_pre"]
+            )
+        )
+
+
+    if s["pre_to_strict"] is not None:
+
+        transition_lines.append(
+            "PRE-STRICT→STRICT："
+            + pct_text(
+                s["pre_to_strict"]
+            )
+        )
+
+
+    if transition_lines:
+
+        lines.append("")
+
+        lines.extend(
+            transition_lines
+        )
+
+
+    return "\n".join(
+        lines
+    )
+
+
+# ============================================================
 # 通知
 # ============================================================
 
@@ -1202,7 +1849,9 @@ def notify_signal(
 ):
 
     base = r["base"]
+
     status = r["status"]
+
 
     symbol_state = (
         state
@@ -1216,28 +1865,43 @@ def notify_signal(
         )
     )
 
+
     previous = symbol_state.get(
         "status",
         "UNKNOWN"
     )
+
 
     print(
         f"{base}: "
         f"{previous} -> {status}"
     )
 
-    # 同狀態不重複通知
+
+    # --------------------------------------------------------
+    # 先更新階段價格
+    # --------------------------------------------------------
+
+    update_stage_memory(
+        r,
+        symbol_state,
+        previous
+    )
+
+
+    # --------------------------------------------------------
+    # 同狀態不重複發通知
+    # 但 current_price 已經更新
+    # --------------------------------------------------------
+
     if status == previous:
 
         symbol_state[
             "updated_utc"
-        ] = (
-            datetime.now(
-                timezone.utc
-            ).isoformat()
-        )
+        ] = now_iso()
 
         return
+
 
     ratio = r.get(
         "4h_volume_ratio"
@@ -1249,26 +1913,59 @@ def notify_signal(
         else "N/A"
     )
 
+
+    stage_block = build_stage_block(
+        symbol_state
+    )
+
+
     # ========================================================
     # STRICT
     # ========================================================
 
     if status == "STRICT":
 
+        stats = stage_stats(
+            symbol_state
+        )
+
+        chase = stats.get(
+            "pre_to_strict"
+        )
+
+        chase_text = (
+            pct_text(chase)
+            if chase is not None
+            else "N/A"
+        )
+
+
         send_ntfy(
             f"2560 STRICT {base}",
             (
                 f"{base} 正式 2560 STRICT\n"
-                f"Gate：{r['contract']}\n"
-                f"4H close：{r['latest_close']}\n"
+                f"Gate：{r['contract']}\n\n"
+
+                f"{stage_block}\n\n"
+
+                f"PRE→STRICT追價幅度："
+                f"{chase_text}\n\n"
+
+                f"4H close："
+                f"{price_text(r['latest_4h_close'])}\n"
+
                 f"4H CORE=True\n"
                 f"1D=True\n"
-                f"Vol5/Vol60={ratio_text}\n\n"
+
+                f"Vol5/Vol60="
+                f"{ratio_text}\n\n"
+
                 f"進入長壽多網格人工複核。"
             ),
             "high",
             "chart_with_upwards_trend,bell"
         )
+
 
     # ========================================================
     # PRE-STRICT
@@ -1279,18 +1976,27 @@ def notify_signal(
         send_ntfy(
             f"2560 PRE-STRICT {base}",
             (
-                f"{base} 進入 PRE-STRICT\n"
+                f"{base} 進入 PRE-STRICT\n\n"
+
+                f"{stage_block}\n\n"
+
                 f"1H=True\n"
                 f"4H structure=True\n"
                 f"4H relaxed volume=True\n"
                 f"1D=True\n"
+
                 f"4H Core 尚未完成\n"
-                f"Vol5/Vol60={ratio_text}\n\n"
-                f"趨勢與量能已成熟，等待原版 Strict 觸發。"
+
+                f"Vol5/Vol60="
+                f"{ratio_text}\n\n"
+
+                f"趨勢與量能已成熟，"
+                f"等待原版 Strict 觸發。"
             ),
             "high",
             "eyes,chart_with_upwards_trend"
         )
+
 
     # ========================================================
     # TREND_READY
@@ -1301,18 +2007,25 @@ def notify_signal(
         send_ntfy(
             f"2560 TREND READY {base}",
             (
-                f"{base} 趨勢正在形成\n"
+                f"{base} 進入 TREND_READY\n\n"
+
+                f"{stage_block}\n\n"
+
                 f"1H=True\n"
                 f"4H early=True\n"
                 f"4H relaxed volume=True\n"
                 f"1D soft=True\n"
-                f"Vol5/Vol60={ratio_text}\n\n"
+
+                f"Vol5/Vol60="
+                f"{ratio_text}\n\n"
+
                 f"尚不是 Strict。\n"
-                f"開始人工注意，不代表直接開長壽網。"
+                f"開始人工注意。"
             ),
             "default",
             "eyes,chart_with_upwards_trend"
         )
+
 
     # ========================================================
     # WATCH
@@ -1323,15 +2036,21 @@ def notify_signal(
         send_ntfy(
             f"2560 WATCH {base}",
             (
-                f"{base} 進入 WATCH\n"
+                f"{base} 進入 WATCH\n\n"
+
+                f"{stage_block}\n\n"
+
                 f"1H 多頭已成立\n"
-                f"4H / 量能 / 1D 尚未成熟\n"
-                f"價格：{r['latest_close']}\n\n"
+
+                f"4H / 量能 / 1D "
+                f"尚未完全成熟。\n\n"
+
                 f"先觀察。"
             ),
             "default",
             "eyes"
         )
+
 
     # ========================================================
     # NO_SIGNAL
@@ -1349,13 +2068,24 @@ def notify_signal(
             send_ntfy(
                 f"2560 signal invalid {base}",
                 (
-                    f"{base} 2560 候選環境已失效\n"
-                    f"前一狀態：{previous}\n"
-                    f"價格：{r['latest_close']}"
+                    f"{base} 2560 候選環境失效\n\n"
+
+                    f"{stage_block}\n\n"
+
+                    f"前一狀態："
+                    f"{previous}\n\n"
+
+                    f"這一輪歷史先保留，"
+                    f"下一個新週期開始時重置。"
                 ),
                 "default",
                 "warning"
             )
+
+
+    # ========================================================
+    # 更新狀態
+    # ========================================================
 
     symbol_state[
         "status"
@@ -1363,11 +2093,7 @@ def notify_signal(
 
     symbol_state[
         "updated_utc"
-    ] = (
-        datetime.now(
-            timezone.utc
-        ).isoformat()
-    )
+    ] = now_iso()
 
 
 # ============================================================
@@ -1377,22 +2103,23 @@ def notify_signal(
 def main():
 
     print(
-        "2560 Cloud Monitor | v4.2"
+        "2560 Cloud Monitor | v4.3"
     )
 
     print(
-        datetime.now(
-            timezone.utc
-        ).isoformat()
+        now_iso()
     )
+
 
     state = load_state()
 
     contracts = discover_contracts()
 
+
     print(
         "\nCONTRACT MAP"
     )
+
 
     for base in REQUESTED:
 
@@ -1401,18 +2128,22 @@ def main():
             f"{contracts.get(base)}"
         )
 
+
     results = []
     errors = []
+
 
     print(
         "\nSCAN"
     )
+
 
     for base in REQUESTED:
 
         contract = contracts.get(
             base
         )
+
 
         if not contract:
 
@@ -1421,6 +2152,7 @@ def main():
             )
 
             continue
+
 
         try:
 
@@ -1433,6 +2165,7 @@ def main():
                 r
             )
 
+
             if (
                 r["status"]
                 == "WAIT_HISTORY"
@@ -1441,12 +2174,14 @@ def main():
                 print(
                     f"{base:<5} "
                     f"WAIT_HISTORY "
+                    f"5m={r['bars_5m']} "
                     f"1H={r['bars_1h']} "
                     f"4H={r['bars_4h']} "
                     f"1D={r['bars_1d']}"
                 )
 
                 continue
+
 
             ratio = r.get(
                 "4h_volume_ratio"
@@ -1458,25 +2193,51 @@ def main():
                 else "N/A"
             )
 
+
             print(
                 f"{base:<5} "
                 f"{r['status']:<12} "
-                f"contract={contract:<18} "
-                f"4Hclose={r['latest_close']} "
-                f"1H={r['1h_confirm']} "
-                f"4Hearly={r['4h_early']} "
-                f"4Hstruct={r['4h_structure']} "
-                f"VolRelax={r['4h_volume_relaxed']} "
-                f"V5/V60={ratio_text} "
-                f"4Hcore={r['4h_core']} "
-                f"1Dsoft={r['1d_soft']} "
-                f"1D={r['1d_confirm']}"
+
+                f"contract="
+                f"{contract:<18} "
+
+                f"now="
+                f"{price_text(r['current_price'])} "
+
+                f"4Hclose="
+                f"{price_text(r['latest_4h_close'])} "
+
+                f"1H="
+                f"{r['1h_confirm']} "
+
+                f"4Hearly="
+                f"{r['4h_early']} "
+
+                f"4Hstruct="
+                f"{r['4h_structure']} "
+
+                f"VolRelax="
+                f"{r['4h_volume_relaxed']} "
+
+                f"V5/V60="
+                f"{ratio_text} "
+
+                f"4Hcore="
+                f"{r['4h_core']} "
+
+                f"1Dsoft="
+                f"{r['1d_soft']} "
+
+                f"1D="
+                f"{r['1d_confirm']}"
             )
+
 
             notify_signal(
                 r,
                 state
             )
+
 
         except Exception as e:
 
@@ -1492,15 +2253,23 @@ def main():
                 f"ERROR {e}"
             )
 
+
         time.sleep(
             0.12
         )
+
 
     save_state(
         state
     )
 
+
+    # ========================================================
+    # Summary
+    # ========================================================
+
     counts = {}
+
 
     for r in results:
 
@@ -1516,6 +2285,7 @@ def main():
             )
             + 1
         )
+
 
     print(
         "\nSTATUS COUNTS:",
