@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-2560 Cloud Monitor v3.2 — PRE-STRICT Long-Life Grid
+2560 Cloud Monitor v3.4 — PRE-STRICT Long-Life Grid
 ===================================================
 
 用途
@@ -31,7 +31,7 @@
    - 若先前已有 PRE-STRICT，判斷是否適合另開第二網 B
    - 不自動下單，只通知
 
-5. 長壽網格原則（v3.2 資產分流）：
+5. 長壽網格原則（v3.4 資產分流）：
    - 生存 > 順趨勢 > 持續成交 > 短期報酬
    - 下沿不能貼現價
    - 依 ATR / 近期支撐動態放寬
@@ -155,6 +155,20 @@ BRKB_MAX_UPPER_PCT = 18.0
 # 強平價要求：實際平台強平價至少再低於網格下沿 10%
 LIQ_BUFFER_BELOW_LOWER_PCT = 10.0
 
+# 強平相容性代理：
+# 真實 Gate 強平價仍受維持保證金率、合約規格、持倉與帳戶模式影響。
+# 這裡只用保守代理先篩掉「區間太深卻還用高槓桿」的組合。
+LIQ_PROXY_EXTRA_RESERVE_PCT = 5.0
+ALLOWED_LEVERAGES = [5, 4, 3, 2]
+
+# 高槓桿額外門檻：允許，但不代表優先。
+# 5x/4x 只有在「下沿較淺 + 波動較低 + 安全餘裕足夠」才可用。
+MAX_5X_LOWER_DISTANCE_PCT = 10.0
+MAX_4X_LOWER_DISTANCE_PCT = 14.0
+MAX_5X_ATR_PCT = 1.8
+MAX_4X_ATR_PCT = 2.8
+MIN_EXTRA_LIQ_HEADROOM_PCT = 2.0
+
 STATE_DIR = Path(".monitor_state")
 STATE_FILE = STATE_DIR / "2560_state.json"
 RESULT_FILE = Path("2560_latest.json")
@@ -243,7 +257,7 @@ def gate_get(path, params=None, retries=5):
                 url,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "2560-cloud-monitor/3.2",
+                    "User-Agent": "2560-cloud-monitor/3.4",
                 },
             )
             with urllib.request.urlopen(req, timeout=30) as r:
@@ -568,11 +582,119 @@ def vol_profile(atr_pct):
     return "HIGH"
 
 
+def required_drop_to_liq_threshold_pct(entry_price, lower):
+    """
+    從入場價跌到「下沿再低10%」的總跌幅。
+    """
+    if not entry_price or not lower or entry_price <= 0:
+        return None
+    threshold = lower * (
+        1.0 - LIQ_BUFFER_BELOW_LOWER_PCT / 100.0
+    )
+    drop = (1.0 - threshold / entry_price) * 100.0
+    return max(0.0, drop)
+
+
+def leverage_proxy_capacity_pct(leverage):
+    """
+    簡化保守代理：
+    理論 1/L 價格跌幅再扣掉額外安全預留。
+    不是 Gate 真實強平價公式。
+    """
+    if leverage <= 0:
+        return 0.0
+    return max(
+        0.0,
+        100.0 / leverage - LIQ_PROXY_EXTRA_RESERVE_PCT,
+    )
+
+
+def choose_safe_leverage(entry_price, lower, atr_pct=None, asset_cls="CRYPTO"):
+    """
+    依長壽網格下沿反推 5x / 4x / 3x / 2x 是否相容。
+
+    原則：
+    - 最大允許 5x
+    - 5x/4x 只在下沿較淺、ATR較低、強平代理有額外餘裕時使用
+    - 高波動或深網格會自動降槓桿
+    - 2x 仍不安全則 REJECT
+    """
+    required = required_drop_to_liq_threshold_pct(
+        entry_price,
+        lower,
+    )
+
+    if required is None:
+        return {
+            "selected_leverage": None,
+            "compatibility_pass": False,
+            "required_drop_pct": None,
+            "proxy_capacity_pct": None,
+            "extra_headroom_pct": None,
+            "reject_reason": "缺少入場價或下沿資料",
+        }
+
+    lower_distance_pct = abs(
+        pct_change(entry_price, lower) or 0.0
+    )
+    atr_now = atr_pct if atr_pct is not None else 999.0
+
+    for lev in ALLOWED_LEVERAGES:
+        capacity = leverage_proxy_capacity_pct(lev)
+        headroom = capacity - required
+
+        # 基本強平相容性先通過
+        if capacity < required:
+            continue
+
+        # 5x 只給淺區間、低波動，而且要有額外安全餘裕
+        if lev == 5:
+            if lower_distance_pct > MAX_5X_LOWER_DISTANCE_PCT:
+                continue
+            if atr_now > MAX_5X_ATR_PCT:
+                continue
+            if headroom < MIN_EXTRA_LIQ_HEADROOM_PCT:
+                continue
+
+        # 4x 比 5x 寬一點，但仍不給深網/高波動
+        if lev == 4:
+            if lower_distance_pct > MAX_4X_LOWER_DISTANCE_PCT:
+                continue
+            if atr_now > MAX_4X_ATR_PCT:
+                continue
+            if headroom < MIN_EXTRA_LIQ_HEADROOM_PCT:
+                continue
+
+        # 3x / 2x 只看強平相容性，不額外卡 ATR
+        return {
+            "selected_leverage": lev,
+            "compatibility_pass": True,
+            "required_drop_pct": required,
+            "proxy_capacity_pct": capacity,
+            "extra_headroom_pct": headroom,
+            "reject_reason": None,
+        }
+
+    return {
+        "selected_leverage": None,
+        "compatibility_pass": False,
+        "required_drop_pct": required,
+        "proxy_capacity_pct": leverage_proxy_capacity_pct(
+            min(ALLOWED_LEVERAGES)
+        ),
+        "extra_headroom_pct": None,
+        "reject_reason": (
+            "即使用2x，保守強平相容性代理仍不足；"
+            "不建議建立新網格。"
+        ),
+    }
+
+
 def longlife_grid_plan(base_symbol, r4, current_price, capital_pct):
     """
     生存優先的趨勢長壽多網格。
 
-    v3.2：
+    v3.4：
     - Crypto 與 US-stock perpetual 使用不同風險尺
     - 股票不再直接吃 30/60 日絕對最低點
     - 改用近期「有效支撐」(低點分位數) + ATR 安全距離
@@ -610,7 +732,6 @@ def longlife_grid_plan(base_symbol, r4, current_price, capital_pct):
     min_upper = cfg["min_upper"]
     max_upper = cfg["max_upper"]
     per_grid_target = cfg["per_grid"]
-    leverage = cfg["leverage"]
 
     # ATR 安全距離
     # Crypto 允許較深，股票不讓 ATR 把區間拉到海溝
@@ -659,6 +780,16 @@ def longlife_grid_plan(base_symbol, r4, current_price, capital_pct):
     actual_lower_pct = abs(
         pct_change(current_price, lower) or 0.0
     )
+
+    # 區間先決定，再由下沿反推可用槓桿。
+    # 避免「下沿很深但仍固定3x」與強平安全目標互相衝突。
+    liq_check = choose_safe_leverage(
+        current_price,
+        lower,
+        atr_pct=atr_pct,
+        asset_cls=cls,
+    )
+    leverage = liq_check.get("selected_leverage")
 
     # 上沿：近期壓力 + 趨勢延伸
     resistance = recent_high(r4, resistance_bars)
@@ -727,17 +858,16 @@ def longlife_grid_plan(base_symbol, r4, current_price, capital_pct):
     flash20_price = current_price * 0.80
     flash20_inside = lower <= flash20_price
 
-    # 股票不要求每張網都必須吃住 -20%，重點是合理長壽 + 資金效率
-    if cls == "US_STOCK_PERP":
-        survival_pass = (
-            actual_lower_pct >= min_lower
-            and actual_lower_pct <= max_lower + 0.01
-        )
-    else:
-        survival_pass = (
-            actual_lower_pct >= min_lower
-            and actual_lower_pct <= max_lower + 0.01
-        )
+    range_pass = (
+        actual_lower_pct >= min_lower
+        and actual_lower_pct <= max_lower + 0.01
+    )
+
+    # v3.4：生存 PASS 必須同時通過「區間合理」與「槓桿相容」。
+    survival_pass = (
+        range_pass
+        and liq_check.get("compatibility_pass", False)
+    )
 
     return {
         "asset_class": cls,
@@ -754,6 +884,11 @@ def longlife_grid_plan(base_symbol, r4, current_price, capital_pct):
         "grid_mode": "GEOMETRIC",
         "estimated_gross_per_grid_pct": geometric_grid_pct,
         "suggested_leverage": leverage,
+        "leverage_compatibility_pass": liq_check.get("compatibility_pass"),
+        "required_drop_to_liq_threshold_pct": liq_check.get("required_drop_pct"),
+        "leverage_proxy_capacity_pct": liq_check.get("proxy_capacity_pct"),
+        "leverage_extra_headroom_pct": liq_check.get("extra_headroom_pct"),
+        "grid_reject_reason": liq_check.get("reject_reason"),
         "capital_pct": capital_pct,
         "atr14": atr14,
         "atr_pct": atr_pct,
@@ -771,9 +906,14 @@ def longlife_grid_plan(base_symbol, r4, current_price, capital_pct):
             f"平台實際強平價需 <= "
             f"{price_text(required_liq_below)} "
             f"(至少低於下沿 "
-            f"{LIQ_BUFFER_BELOW_LOWER_PCT:.0f}%)"
+            f"{LIQ_BUFFER_BELOW_LOWER_PCT:.0f}%)；"
+            f"程式槓桿判斷僅為保守代理，最終以Gate建單畫面為準。"
         ),
         "survival_pass": survival_pass,
+        "leverage_policy": (
+            "最大5x；5x/4x僅在淺下沿、低ATR、且強平代理有額外餘裕時使用；"
+            "高波動/深網格自動降至3x或2x。"
+        ),
     }
 
 
@@ -942,7 +1082,17 @@ def format_grid(plan):
     survival = (
         "PASS"
         if plan.get("survival_pass")
-        else "CHECK"
+        else "REJECT"
+    )
+
+    lev = plan.get("suggested_leverage")
+    lev_text = f"{lev}x" if lev else "不開"
+
+    reject_reason = plan.get("grid_reject_reason")
+    decision = (
+        "可建立候選網格，建單時再核對Gate實際強平價。"
+        if plan.get("survival_pass")
+        else f"不建議開網：{reject_reason or '生存條件未通過'}"
     )
 
     return (
@@ -956,8 +1106,11 @@ def format_grid(plan):
         f"格數：{plan.get('grid_count')}\n"
         f"模式：等比\n"
         f"預估單格毛幅：約 {plan.get('estimated_gross_per_grid_pct', 0):.2f}%\n"
-        f"建議槓桿：{plan.get('suggested_leverage')}x\n"
+        f"建議槓桿：{lev_text}\n"
         f"建議投入：總預算 {plan.get('capital_pct')}%\n"
+        f"強平安全所需總跌幅：{pct_text(-plan.get('required_drop_to_liq_threshold_pct')) if plan.get('required_drop_to_liq_threshold_pct') is not None else 'N/A'}\n"
+        f"槓桿代理可承受：{pct_text(-plan.get('leverage_proxy_capacity_pct')) if plan.get('leverage_proxy_capacity_pct') is not None else 'N/A'}\n"
+        f"額外安全餘裕：{pct_text(plan.get('leverage_extra_headroom_pct'))}\n"
         f"4H ATR：{pct_text(plan.get('atr_pct'))}\n"
         f"波動級別：{plan.get('vol_profile')}\n"
         f"近期有效支撐：{price_text(plan.get('support_short'))}\n"
@@ -965,7 +1118,9 @@ def format_grid(plan):
         f"本類型下沿上限：-{plan.get('max_lower_pct'):.1f}%\n"
         f"20%快速回撤：{flash}\n"
         f"強平安全要求：{plan.get('liquidation_rule')}\n"
-        f"生存檢查：{survival}"
+        f"生存檢查：{survival}\n"
+        f"網格決策：{decision}\n"
+        f"槓桿政策：{plan.get('leverage_policy')}"
     )
 
 
@@ -1058,7 +1213,7 @@ def notify_status_change(r, state):
 # ============================================================
 
 def main():
-    print("2560 Cloud Monitor | PRE-STRICT Long-Life Grid v3.2")
+    print("2560 Cloud Monitor | PRE-STRICT Long-Life Grid v3.4")
     print("UTC:", now_iso())
     print(
         "Rule: NO_SIGNAL -> WATCH -> TREND_READY -> "
@@ -1112,7 +1267,10 @@ def main():
                     f" grid={price_text(g.get('lower'))}"
                     f"~{price_text(g.get('upper'))}"
                     f" n={g.get('grid_count')}"
-                    f" lev={g.get('suggested_leverage')}x"
+                    f" lev={str(g.get('suggested_leverage')) + 'x' if g.get('suggested_leverage') else 'REJECT'}"
+                    f" liqCompat={g.get('leverage_compatibility_pass')}"
+                    f" atr={pct_text(g.get('atr_pct'))}"
+                    f" headroom={pct_text(g.get('leverage_extra_headroom_pct'))}"
                     f" survive={g.get('survival_pass')}"
                 )
 
@@ -1149,7 +1307,7 @@ def main():
         json.dumps(
             {
                 "generated_utc": now_iso(),
-                "rule_version": "2560_PRESTRICT_LONG_LIFE_GRID_V3_2",
+                "rule_version": "2560_PRESTRICT_LONG_LIFE_GRID_V3_4",
                 "results": results,
             },
             ensure_ascii=False,
