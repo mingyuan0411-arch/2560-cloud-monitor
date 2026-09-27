@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-2560 Cloud Monitor v3.0 — PRE-STRICT Long-Life Grid
+2560 Cloud Monitor v3.1 — PRE-STRICT Long-Life Grid
 ===================================================
 
 用途
@@ -184,7 +184,7 @@ def gate_get(path, params=None, retries=5):
                 url,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "2560-cloud-monitor/3.0",
+                    "User-Agent": "2560-cloud-monitor/3.1",
                 },
             )
             with urllib.request.urlopen(req, timeout=30) as r:
@@ -300,6 +300,10 @@ def add_ind(rows, step):
         r["i"] = i
         r["ma25"] = sma(closes, 25, i)
         r["ma25_prev"] = sma(closes, 25, i - 1)
+        r["ma60"] = sma(closes, 60, i)
+        r["ma60_prev"] = sma(closes, 60, i - 1)
+        r["ma120"] = sma(closes, 120, i)
+        r["ma120_prev"] = sma(closes, 120, i - 1)
         r["vma5"] = sma(vols, 5, i)
         r["vma60"] = sma(vols, 60, i)
         r["vma5_prev"] = sma(vols, 5, i - 1)
@@ -377,6 +381,31 @@ def daily_ok(r):
     )
 
 
+def short_history_4h_proxy_ok(r):
+    """
+    1D 歷史不足 25 根時的保守代理。
+    只用既有 4H 歷史，不生成假的日K。
+    約以 60/120 根 4H 均線檢查較慢趨勢。
+    注意：此代理只允許走到 PRE-STRICT，不允許產生 canonical STRICT。
+    """
+    need = [
+        r.get("ma60"),
+        r.get("ma120"),
+        r.get("ma120_prev"),
+        r.get("vma5"),
+        r.get("vma60"),
+    ]
+    if any(x is None for x in need):
+        return False
+
+    return (
+        r["c"] > r["ma120"]
+        and r["ma60"] > r["ma120"]
+        and r["ma120"] >= r["ma120_prev"]
+        and r["vma5"] >= r["vma60"] * RELAXED_VOL_RATIO
+    )
+
+
 def last_completed_daily_asof(daily, close_t):
     ans = None
     for r in daily:
@@ -409,24 +438,27 @@ def kept_strict(r4, rd):
     return kept
 
 
-def classify_status(latest, d, strict_now):
+def classify_status(latest, d, strict_now, history_mode="FULL_1D"):
     s4 = structure_4h_ok(latest)
     rv = relaxed_volume_ok(latest)
-    dsoft = daily_soft_ok(d)
-    dstrict = daily_ok(d)
 
-    if strict_now:
+    if history_mode == "FULL_1D":
+        dsoft = daily_soft_ok(d)
+    elif history_mode == "SHORT_1D_MA25":
+        dsoft = daily_soft_ok(d)
+    else:
+        dsoft = short_history_4h_proxy_ok(latest)
+
+    if strict_now and history_mode == "FULL_1D":
         return "STRICT"
 
-    # PRE-STRICT: 價格結構 + 放寬量能 + 日線至少 soft
+    # PRE-STRICT 可使用短歷史代理，但 STRICT 不可。
     if s4 and rv and dsoft:
         return "PRE-STRICT"
 
-    # TREND_READY: 4H 結構 + 日線 soft，但量能還沒跟上
     if s4 and dsoft:
         return "TREND_READY"
 
-    # WATCH: 4H 或日線已有一邊轉好
     if s4 or dsoft:
         return "WATCH"
 
@@ -599,26 +631,59 @@ def analyze(base_symbol, contract):
         now,
     )
 
-    if len(r4) < 65 or len(rd) < 65:
-        raise RuntimeError(
-            f"insufficient candles: 4h={len(r4)} 1d={len(rd)}"
-        )
+    # 4H 至少要能算 MA120；不足才是真正 WAIT_HISTORY。
+    if len(r4) < 121:
+        return {
+            "base": base_symbol,
+            "contract": contract,
+            "group": (
+                "VALIDATED"
+                if base_symbol in VALIDATED
+                else "EXTENDED"
+            ),
+            "status": "WAIT_HISTORY",
+            "history_mode": "INSUFFICIENT_4H",
+            "history_4h_bars": len(r4),
+            "history_1d_bars": len(rd),
+        }
 
     add_ind(r4, FOUR_H)
-    add_ind(rd, ONE_D)
+
+    # 1D >= 61：完整 canonical 2560 日線確認。
+    # 25~60：可做 MA25 soft 判斷，但 STRICT 暫不開放。
+    # <25：使用 4H MA60/MA120 保守代理，只允許到 PRE-STRICT。
+    if len(rd) >= 61:
+        add_ind(rd, ONE_D)
+        history_mode = "FULL_1D"
+    elif len(rd) >= 25:
+        add_ind(rd, ONE_D)
+        history_mode = "SHORT_1D_MA25"
+    else:
+        history_mode = "4H_PROXY"
 
     latest = r4[-1]
-    raw_now, d = strict_raw_at(latest, rd)
-    kept = kept_strict(r4, rd)
-    strict_now = bool(
-        kept
-        and kept[-1]["t"] == latest["t"]
-    )
+
+    d = None
+    raw_now = False
+    strict_now = False
+
+    if history_mode in ("FULL_1D", "SHORT_1D_MA25"):
+        d = last_completed_daily_asof(rd, latest["close_t"])
+
+    # 只有完整日線歷史才允許 canonical STRICT
+    if history_mode == "FULL_1D":
+        raw_now, d = strict_raw_at(latest, rd)
+        kept = kept_strict(r4, rd)
+        strict_now = bool(
+            kept
+            and kept[-1]["t"] == latest["t"]
+        )
 
     status = classify_status(
         latest,
         d,
         strict_now,
+        history_mode,
     )
 
     grid = None
@@ -635,6 +700,16 @@ def analyze(base_symbol, contract):
             STRICT_GRID_B_PCT,
         )
 
+    if history_mode == "FULL_1D":
+        dsoft = daily_soft_ok(d)
+        dconfirm = daily_ok(d)
+    elif history_mode == "SHORT_1D_MA25":
+        dsoft = daily_soft_ok(d)
+        dconfirm = False
+    else:
+        dsoft = short_history_4h_proxy_ok(latest)
+        dconfirm = False
+
     return {
         "base": base_symbol,
         "contract": contract,
@@ -644,14 +719,18 @@ def analyze(base_symbol, contract):
             else "EXTENDED"
         ),
         "status": status,
+        "history_mode": history_mode,
+        "history_4h_bars": len(r4),
+        "history_1d_bars": len(rd),
+        "strict_allowed": history_mode == "FULL_1D",
         "latest_4h_open_utc": iso(latest["t"]),
         "latest_4h_close_utc": iso(latest["close_t"]),
         "latest_close": latest["c"],
         "4h_structure": structure_4h_ok(latest),
         "4h_relaxed_volume": relaxed_volume_ok(latest),
         "4h_core": core_ok(latest),
-        "1d_soft": daily_soft_ok(d),
-        "1d_confirm": daily_ok(d),
+        "1d_soft": dsoft,
+        "1d_confirm": dconfirm,
         "strict_raw": raw_now,
         "strict": strict_now,
         "grid": grid,
@@ -728,9 +807,13 @@ def notify_pre_strict(r):
         f"現價：{price_text(r.get('latest_close'))}\n"
         f"4H結構：{r.get('4h_structure')}\n"
         f"4H放寬量能：{r.get('4h_relaxed_volume')}\n"
-        f"1D soft：{r.get('1d_soft')}\n\n"
+        f"1D soft：{r.get('1d_soft')}\n"
+        f"歷史模式：{r.get('history_mode')} "
+        f"(4H={r.get('history_4h_bars')} / 1D={r.get('history_1d_bars')})\n"
+        f"STRICT可用：{r.get('strict_allowed')}\n\n"
         f"【長壽網格 A】\n"
         f"{format_grid(g)}\n\n"
+        f"{'⚠ 短歷史標的：可作 PRE-STRICT 第一網候選，但在 1D 歷史滿 61 根前不產生 STRICT。\\n' if not r.get('strict_allowed') else ''}"
         f"原則：寧可寬一點、少成交幾格，也不要下沿太貼現價。"
     )
     send_ntfy(
@@ -805,7 +888,7 @@ def notify_status_change(r, state):
 # ============================================================
 
 def main():
-    print("2560 Cloud Monitor | PRE-STRICT Long-Life Grid v3.0")
+    print("2560 Cloud Monitor | PRE-STRICT Long-Life Grid v3.1")
     print("UTC:", now_iso())
     print(
         "Rule: NO_SIGNAL -> WATCH -> TREND_READY -> "
@@ -842,6 +925,16 @@ def main():
             r = analyze(base, contract)
             results.append(r)
 
+            if r.get("status") == "WAIT_HISTORY":
+                print(
+                    f"{base:<5} WAIT_HISTORY "
+                    f"4H={r.get('history_4h_bars')} "
+                    f"1D={r.get('history_1d_bars')}"
+                )
+                notify_status_change(r, state)
+                time.sleep(0.15)
+                continue
+
             g = r.get("grid") or {}
             grid_text = ""
             if r["status"] in ("PRE-STRICT", "STRICT"):
@@ -861,7 +954,10 @@ def main():
                 f"relVol={r['4h_relaxed_volume']} "
                 f"4Hcore={r['4h_core']} "
                 f"1Dsoft={r['1d_soft']} "
-                f"1D={r['1d_confirm']}"
+                f"1D={r['1d_confirm']} "
+                f"hist={r.get('history_mode')} "
+                f"bars4H={r.get('history_4h_bars')} "
+                f"bars1D={r.get('history_1d_bars')}"
                 f"{grid_text}"
             )
 
@@ -883,7 +979,7 @@ def main():
         json.dumps(
             {
                 "generated_utc": now_iso(),
-                "rule_version": "2560_PRESTRICT_LONG_LIFE_GRID_V3",
+                "rule_version": "2560_PRESTRICT_LONG_LIFE_GRID_V3_1",
                 "results": results,
             },
             ensure_ascii=False,
