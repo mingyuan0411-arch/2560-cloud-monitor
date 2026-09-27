@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-2560 Cloud Monitor v4.4
+2560 Cloud Monitor v4.5
 =======================
 
 狀態：
@@ -26,17 +26,15 @@ STRICT
 
 20-bar dedup
 
-v4.4 功能：
-- WATCH / TREND_READY / PRE-STRICT / STRICT 階段價格記憶
-- 各階段首次出現時間
-- 5m 完成K作為接近現價
-- 各階段 -> 目前 漲跌幅
-- 各階段之間漲幅
-- PRE-STRICT -> STRICT 追價幅度
-- 最近4H壓力價 / 距離
-- 最近1D壓力價 / 距離
-- NO_SIGNAL 時保留本輪歷史
-- 新週期開始時重置
+v4.5：
+- 即時目前價改用 Gate futures ticker "last"
+- 不再用 5m close 當目前價
+- 4H 壓力改用 Swing High
+- 1D 壓力改用 Swing High
+- 保留階段價格記憶
+- 保留各階段 -> 目前漲跌幅
+- 保留 PRE-STRICT -> STRICT 追價幅度
+- STRICT 原始規則完全不動
 
 Public Gate data only.
 No API key.
@@ -88,20 +86,35 @@ REQUESTED = VALIDATED + EXTENDED
 
 
 # ============================================================
-# K線時間
+# K線
 # ============================================================
 
-FIVE_M = 5 * 60
 ONE_H = 60 * 60
 FOUR_H = 4 * 60 * 60
 ONE_D = 24 * 60 * 60
 
-LIMIT_5M = 20
 LIMIT_1H = 220
 LIMIT_4H = 220
-LIMIT_1D = 120
+LIMIT_1D = 160
 
 DEDUP_BARS = 20
+
+
+# ============================================================
+# Swing High 設定
+# ============================================================
+
+# 4H：
+# 前2根 + 後2根，中央最高才算局部壓力
+SWING_4H_LEFT = 2
+SWING_4H_RIGHT = 2
+SWING_4H_LOOKBACK = 60
+
+# 1D：
+# 日線雜訊比較少，但仍用前後2根
+SWING_1D_LEFT = 2
+SWING_1D_RIGHT = 2
+SWING_1D_LOOKBACK = 90
 
 
 # ============================================================
@@ -222,6 +235,7 @@ def gate_get(
 
     last_error = None
 
+
     for attempt in range(retries):
 
         try:
@@ -230,16 +244,21 @@ def gate_get(
                 url,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "2560-cloud-monitor/4.4",
+                    "User-Agent":
+                        "2560-cloud-monitor/4.5",
                 }
             )
+
 
             with urllib.request.urlopen(
                 req,
                 timeout=30
             ) as resp:
 
-                return json.load(resp)
+                return json.load(
+                    resp
+                )
+
 
         except Exception as e:
 
@@ -252,8 +271,10 @@ def gate_get(
                 )
             )
 
+
     raise RuntimeError(
-        f"Gate request failed: {last_error}"
+        f"Gate request failed: "
+        f"{last_error}"
     )
 
 
@@ -278,6 +299,7 @@ def discover_contracts():
         for name in names
     }
 
+
     aliases = {
 
         "BRKB": [
@@ -292,7 +314,9 @@ def discover_contracts():
         ],
     }
 
+
     mapping = {}
+
 
     for base in REQUESTED:
 
@@ -307,6 +331,7 @@ def discover_contracts():
 
         found = None
 
+
         for candidate in candidates:
 
             possible = [
@@ -314,6 +339,7 @@ def discover_contracts():
                 candidate + "USDT",
                 candidate + "_USDT",
             ]
+
 
             for item in possible:
 
@@ -323,18 +349,79 @@ def discover_contracts():
 
                 if key in normalized_names:
 
-                    found = normalized_names[
-                        key
-                    ]
+                    found = (
+                        normalized_names[
+                            key
+                        ]
+                    )
 
                     break
+
 
             if found:
                 break
 
+
         mapping[base] = found
 
+
     return mapping
+
+
+# ============================================================
+# 真實目前價
+# Gate futures ticker last
+# ============================================================
+
+def fetch_last_price(
+    contract
+):
+
+    data = gate_get(
+        "/futures/usdt/tickers",
+        {
+            "contract":
+                contract
+        }
+    )
+
+
+    if (
+        not isinstance(
+            data,
+            list
+        )
+        or
+        len(data) == 0
+    ):
+
+        raise RuntimeError(
+            f"No ticker data "
+            f"for {contract}"
+        )
+
+
+    ticker = data[0]
+
+    last = ticker.get(
+        "last"
+    )
+
+
+    if last in (
+        None,
+        "",
+    ):
+
+        raise RuntimeError(
+            f"No last price "
+            f"for {contract}"
+        )
+
+
+    return float(
+        last
+    )
 
 
 # ============================================================
@@ -350,28 +437,65 @@ def fetch(
     raw = gate_get(
         "/futures/usdt/candlesticks",
         {
-            "contract": contract,
-            "interval": interval,
-            "limit": limit,
+            "contract":
+                contract,
+
+            "interval":
+                interval,
+
+            "limit":
+                limit,
         }
     )
 
+
     rows = []
+
 
     for x in raw:
 
         rows.append({
-            "t": int(x["t"]),
-            "o": float(x["o"]),
-            "h": float(x["h"]),
-            "l": float(x["l"]),
-            "c": float(x["c"]),
-            "v": float(x.get("v", 0)),
+
+            "t":
+                int(
+                    x["t"]
+                ),
+
+            "o":
+                float(
+                    x["o"]
+                ),
+
+            "h":
+                float(
+                    x["h"]
+                ),
+
+            "l":
+                float(
+                    x["l"]
+                ),
+
+            "c":
+                float(
+                    x["c"]
+                ),
+
+            "v":
+                float(
+                    x.get(
+                        "v",
+                        0
+                    )
+                ),
         })
 
+
     rows.sort(
-        key=lambda z: z["t"]
+        key=lambda z:
+            z["t"]
     )
+
 
     return rows
 
@@ -385,7 +509,11 @@ def completed_only(
     return [
         r
         for r in rows
-        if r["t"] + seconds <= now_ts
+        if (
+            r["t"]
+            + seconds
+            <= now_ts
+        )
     ]
 
 
@@ -402,12 +530,15 @@ def sma(
     if i + 1 < n:
         return None
 
-    return sum(
-        values[
-            i - n + 1:
-            i + 1
-        ]
-    ) / n
+    return (
+        sum(
+            values[
+                i - n + 1:
+                i + 1
+            ]
+        )
+        / n
+    )
 
 
 def add_indicators(
@@ -425,9 +556,11 @@ def add_indicators(
         for r in rows
     ]
 
+
     for i, r in enumerate(rows):
 
         r["i"] = i
+
 
         r["ma5"] = sma(
             closes,
@@ -459,6 +592,7 @@ def add_indicators(
             i
         )
 
+
         r["ma25_prev"] = (
             sma(
                 closes,
@@ -468,6 +602,7 @@ def add_indicators(
             if i >= 25
             else None
         )
+
 
         r["vma5"] = sma(
             volumes,
@@ -481,6 +616,7 @@ def add_indicators(
             i
         )
 
+
         r["vma5_prev"] = (
             sma(
                 volumes,
@@ -491,6 +627,7 @@ def add_indicators(
             else None
         )
 
+
         r["vma60_prev"] = (
             sma(
                 volumes,
@@ -500,6 +637,7 @@ def add_indicators(
             if i >= 60
             else None
         )
+
 
         r["close_t"] = (
             r["t"]
@@ -519,22 +657,28 @@ def one_hour_confirm(r):
         r.get("ma20"),
     ]
 
+
     if any(
         x is None
         for x in needed
     ):
+
         return False
 
+
     return (
-        r["c"] > r["ma20"]
+        r["c"]
+        > r["ma20"]
 
         and
 
-        r["ma5"] > r["ma10"]
+        r["ma5"]
+        > r["ma10"]
 
         and
 
-        r["ma10"] > r["ma20"]
+        r["ma10"]
+        > r["ma20"]
     )
 
 
@@ -545,11 +689,17 @@ def one_hour_confirm(r):
 def four_hour_structure(r):
 
     if (
-        r.get("ma25") is None
+        r.get("ma25")
+        is None
+
         or
-        r.get("ma25_prev") is None
+
+        r.get("ma25_prev")
+        is None
     ):
+
         return False
+
 
     return (
         r["ma25"]
@@ -569,21 +719,29 @@ def four_hour_structure(r):
 def four_hour_early(r):
 
     if (
-        r.get("ma25") is None
+        r.get("ma25")
+        is None
+
         or
-        r.get("ma25_prev") is None
+
+        r.get("ma25_prev")
+        is None
     ):
+
         return False
+
 
     price_ok = (
         r["c"]
         > r["ma25"]
     )
 
+
     slope_ok = (
         r["ma25"]
         >= r["ma25_prev"]
     )
+
 
     return (
         price_ok
@@ -604,21 +762,30 @@ def relaxed_volume_ok(r):
         r.get("vma5_prev"),
     ]
 
+
     if any(
         x is None
         for x in needed
     ):
+
         return False
+
 
     near_long_volume = (
         r["vma5"]
-        >= r["vma60"] * 0.90
+        >=
+        r["vma60"]
+        * 0.90
     )
+
 
     volume_rising = (
         r["vma5"]
-        > r["vma5_prev"] * 1.02
+        >
+        r["vma5_prev"]
+        * 1.02
     )
+
 
     return (
         near_long_volume
@@ -629,6 +796,7 @@ def relaxed_volume_ok(r):
 
 # ============================================================
 # 原版 4H STRICT CORE
+# 完全不改
 # ============================================================
 
 def core_ok(r):
@@ -642,13 +810,17 @@ def core_ok(r):
         r.get("vma60_prev"),
     ]
 
+
     if any(
         x is None
         for x in needed
     ):
+
         return False
 
+
     return (
+
         r["ma25"]
         > r["ma25_prev"]
 
@@ -671,12 +843,14 @@ def core_ok(r):
 
 # ============================================================
 # 原版 1D STRICT
+# 完全不改
 # ============================================================
 
 def daily_confirm(r):
 
     if r is None:
         return False
+
 
     needed = [
         r.get("ma25"),
@@ -685,13 +859,17 @@ def daily_confirm(r):
         r.get("vma60"),
     ]
 
+
     if any(
         x is None
         for x in needed
     ):
+
         return False
 
+
     return (
+
         r["c"]
         > r["ma25"]
 
@@ -716,17 +894,24 @@ def daily_soft_confirm(r):
     if r is None:
         return False
 
-    if r.get("ma25") is None:
+
+    if r.get(
+        "ma25"
+    ) is None:
+
         return False
+
 
     return (
         r["c"]
-        >= r["ma25"] * 0.97
+        >=
+        r["ma25"]
+        * 0.97
     )
 
 
 # ============================================================
-# Daily alignment
+# Daily Alignment
 # ============================================================
 
 def last_completed_daily_asof(
@@ -736,19 +921,26 @@ def last_completed_daily_asof(
 
     ans = None
 
+
     for r in daily:
 
-        if r["close_t"] <= close_t:
+        if (
+            r["close_t"]
+            <= close_t
+        ):
+
             ans = r
 
         else:
+
             break
+
 
     return ans
 
 
 # ============================================================
-# STRICT history
+# STRICT History
 # ============================================================
 
 def strict_raw_at(
@@ -756,14 +948,19 @@ def strict_raw_at(
     daily
 ):
 
-    d = last_completed_daily_asof(
-        daily,
-        r4["close_t"]
+    d = (
+        last_completed_daily_asof(
+            daily,
+            r4["close_t"]
+        )
     )
+
 
     return (
         core_ok(r4)
+
         and
+
         daily_confirm(d)
     )
 
@@ -775,6 +972,7 @@ def kept_strict(
 
     raw = []
 
+
     for r in r4:
 
         if strict_raw_at(
@@ -784,9 +982,11 @@ def kept_strict(
 
             raw.append(r)
 
+
     kept = []
 
     last_i = -10**9
+
 
     for r in raw:
 
@@ -800,63 +1000,188 @@ def kept_strict(
 
             last_i = r["i"]
 
+
     return kept
 
 
 # ============================================================
-# 壓力位
+# Swing High
+#
+# 中間K必須高於：
+# 左邊 N 根
+# 右邊 N 根
+#
+# 才是真正局部波段高點
 # ============================================================
 
-def find_recent_resistance(
+def find_swing_highs(
+    rows,
+    left=2,
+    right=2
+):
+
+    swings = []
+
+
+    if (
+        len(rows)
+        <
+        left
+        + right
+        + 1
+    ):
+
+        return swings
+
+
+    for i in range(
+        left,
+        len(rows) - right
+    ):
+
+        center = rows[i]
+
+        center_high = center["h"]
+
+
+        left_highs = [
+            rows[j]["h"]
+            for j in range(
+                i - left,
+                i
+            )
+        ]
+
+
+        right_highs = [
+            rows[j]["h"]
+            for j in range(
+                i + 1,
+                i + right + 1
+            )
+        ]
+
+
+        higher_than_left = all(
+            center_high
+            >
+            x
+            for x in left_highs
+        )
+
+
+        higher_than_right = all(
+            center_high
+            >=
+            x
+            for x in right_highs
+        )
+
+
+        if (
+            higher_than_left
+
+            and
+
+            higher_than_right
+        ):
+
+            swings.append({
+                "index":
+                    i,
+
+                "time":
+                    center["t"],
+
+                "price":
+                    center_high,
+            })
+
+
+    return swings
+
+
+# ============================================================
+# 找目前價上方最近 Swing High
+# ============================================================
+
+def find_nearest_swing_resistance(
     rows,
     current_price,
-    lookback
+    lookback,
+    left,
+    right
 ):
 
     if (
         current_price is None
-        or current_price <= 0
+        or
+        current_price <= 0
     ):
+
         return None
 
-    candidates = []
 
-    for r in rows[-lookback:]:
+    subset = rows[
+        -lookback:
+    ]
 
-        high = r.get("h")
 
-        if (
-            high is not None
-            and
-            high > current_price
-        ):
-
-            candidates.append(
-                high
-            )
-
-    if not candidates:
-        return None
-
-    return min(
-        candidates
+    swings = find_swing_highs(
+        subset,
+        left=left,
+        right=right
     )
 
 
+    above = [
+        s
+        for s in swings
+        if (
+            s["price"]
+            > current_price
+        )
+    ]
+
+
+    if not above:
+
+        return None
+
+
+    # 找「價格上」距離最近的真正波段高點
+    nearest = min(
+        above,
+        key=lambda s:
+            s["price"]
+    )
+
+
+    return nearest
+
+
+# ============================================================
+# 壓力距離
+# ============================================================
+
 def resistance_distance(
     current_price,
-    resistance
+    resistance_price
 ):
 
     if (
         current_price is None
-        or resistance is None
-        or current_price <= 0
+        or
+        resistance_price is None
+        or
+        current_price <= 0
     ):
+
         return None
 
+
     return (
-        resistance
+        resistance_price
         / current_price
         - 1
     ) * 100
@@ -878,21 +1203,20 @@ def analyze(
     )
 
 
-    # --------------------------------------------------------
-    # 5m：只作為接近現價
-    # 完全不參與2560訊號
-    # --------------------------------------------------------
+    # ========================================================
+    # 真正即時成交價
+    # ========================================================
 
-    r5 = completed_only(
-        fetch(
-            contract,
-            "5m",
-            LIMIT_5M
-        ),
-        FIVE_M,
-        now_ts
+    current_price = (
+        fetch_last_price(
+            contract
+        )
     )
 
+
+    # ========================================================
+    # K線
+    # ========================================================
 
     r1 = completed_only(
         fetch(
@@ -928,8 +1252,6 @@ def analyze(
 
 
     if (
-        len(r5) < 1
-        or
         len(r1) < 65
         or
         len(r4) < 65
@@ -947,14 +1269,12 @@ def analyze(
 
             "group":
                 "VALIDATED"
-                if base in VALIDATED
+                if base
+                in VALIDATED
                 else "EXTENDED",
 
             "status":
                 "WAIT_HISTORY",
-
-            "bars_5m":
-                len(r5),
 
             "bars_1h":
                 len(r1),
@@ -983,8 +1303,6 @@ def analyze(
     )
 
 
-    latest5 = r5[-1]
-
     latest1 = r1[-1]
 
     previous1 = r1[-2]
@@ -1000,22 +1318,23 @@ def analyze(
     )
 
 
-    current_price = (
-        latest5["c"]
-    )
-
-
     # ========================================================
     # 1H
     # ========================================================
 
-    oneh_now = one_hour_confirm(
-        latest1
+    oneh_now = (
+        one_hour_confirm(
+            latest1
+        )
     )
 
-    oneh_prev = one_hour_confirm(
-        previous1
+
+    oneh_prev = (
+        one_hour_confirm(
+            previous1
+        )
     )
+
 
     oneh_fresh = (
         oneh_now
@@ -1034,11 +1353,13 @@ def analyze(
         )
     )
 
+
     h4_early = (
         four_hour_early(
             latest4
         )
     )
+
 
     relaxed_volume = (
         relaxed_volume_ok(
@@ -1046,8 +1367,11 @@ def analyze(
         )
     )
 
-    h4_core = core_ok(
-        latest4
+
+    h4_core = (
+        core_ok(
+            latest4
+        )
     )
 
 
@@ -1055,12 +1379,17 @@ def analyze(
     # 1D
     # ========================================================
 
-    day_strict = daily_confirm(
-        latest_d
+    day_strict = (
+        daily_confirm(
+            latest_d
+        )
     )
 
-    day_soft = daily_soft_confirm(
-        latest_d
+
+    day_soft = (
+        daily_soft_confirm(
+            latest_d
+        )
     )
 
 
@@ -1074,18 +1403,26 @@ def analyze(
         day_strict
     )
 
-    strict_kept = kept_strict(
-        r4,
-        rd
+
+    strict_kept = (
+        kept_strict(
+            r4,
+            rd
+        )
     )
 
+
     strict_now = (
-        bool(strict_kept)
+
+        bool(
+            strict_kept
+        )
 
         and
 
         strict_kept[-1]["t"]
-        == latest4["t"]
+        ==
+        latest4["t"]
     )
 
 
@@ -1094,6 +1431,7 @@ def analyze(
     # ========================================================
 
     pre_strict = (
+
         not strict_now
 
         and
@@ -1119,6 +1457,7 @@ def analyze(
     # ========================================================
 
     trend_ready = (
+
         not strict_now
 
         and
@@ -1148,6 +1487,7 @@ def analyze(
     # ========================================================
 
     watch = (
+
         not strict_now
 
         and
@@ -1195,13 +1535,18 @@ def analyze(
 
     volume_ratio = None
 
+
     if (
-        latest4.get("vma5")
+        latest4.get(
+            "vma5"
+        )
         is not None
 
         and
 
-        latest4.get("vma60")
+        latest4.get(
+            "vma60"
+        )
         not in (
             None,
             0
@@ -1216,23 +1561,31 @@ def analyze(
 
 
     # ========================================================
-    # 4H / 1D 壓力
+    # 4H Swing Resistance
     # ========================================================
 
-    resistance_4h = (
-        find_recent_resistance(
+    swing_4h = (
+        find_nearest_swing_resistance(
             r4,
             current_price,
-            48
+            SWING_4H_LOOKBACK,
+            SWING_4H_LEFT,
+            SWING_4H_RIGHT
         )
     )
 
-    resistance_1d = (
-        find_recent_resistance(
-            rd,
-            current_price,
-            60
-        )
+
+    resistance_4h = (
+        swing_4h["price"]
+        if swing_4h
+        else None
+    )
+
+
+    resistance_4h_time = (
+        swing_4h["time"]
+        if swing_4h
+        else None
     )
 
 
@@ -1242,6 +1595,36 @@ def analyze(
             resistance_4h
         )
     )
+
+
+    # ========================================================
+    # 1D Swing Resistance
+    # ========================================================
+
+    swing_1d = (
+        find_nearest_swing_resistance(
+            rd,
+            current_price,
+            SWING_1D_LOOKBACK,
+            SWING_1D_LEFT,
+            SWING_1D_RIGHT
+        )
+    )
+
+
+    resistance_1d = (
+        swing_1d["price"]
+        if swing_1d
+        else None
+    )
+
+
+    resistance_1d_time = (
+        swing_1d["time"]
+        if swing_1d
+        else None
+    )
+
 
     resistance_1d_pct = (
         resistance_distance(
@@ -1261,14 +1644,15 @@ def analyze(
 
         "group":
             "VALIDATED"
-            if base in VALIDATED
+            if base
+            in VALIDATED
             else "EXTENDED",
 
         "status":
             status,
 
 
-        # 5m 完成K作為接近現價
+        # 真正 ticker last
         "current_price":
             current_price,
 
@@ -1311,12 +1695,15 @@ def analyze(
             strict_now,
 
 
-        # 壓力資訊
+        # Swing High 壓力
         "resistance_4h":
             resistance_4h,
 
         "resistance_4h_pct":
             resistance_4h_pct,
+
+        "resistance_4h_time":
+            resistance_4h_time,
 
         "resistance_1d":
             resistance_1d,
@@ -1324,11 +1711,9 @@ def analyze(
         "resistance_1d_pct":
             resistance_1d_pct,
 
+        "resistance_1d_time":
+            resistance_1d_time,
 
-        "latest_5m_open_utc":
-            iso(
-                latest5["t"]
-            ),
 
         "latest_1h_open_utc":
             iso(
@@ -1362,7 +1747,6 @@ def send_ntfy(
         return False
 
 
-    # 中文標題安全處理
     safe_title = str(
         Header(
             title,
@@ -1372,12 +1756,17 @@ def send_ntfy(
 
 
     req = urllib.request.Request(
+
         f"{NTFY_SERVER}/{NTFY_TOPIC}",
+
         data=msg.encode(
             "utf-8"
         ),
+
         method="POST",
+
         headers={
+
             "Title":
                 safe_title,
 
@@ -1388,7 +1777,8 @@ def send_ntfy(
                 tags,
 
             "Content-Type":
-                "text/plain; charset=utf-8",
+                "text/plain; "
+                "charset=utf-8",
         }
     )
 
@@ -1446,13 +1836,16 @@ def load_state():
             encoding="utf-8"
         ) as f:
 
-            state = json.load(f)
+            state = json.load(
+                f
+            )
 
 
         state.setdefault(
             "symbols",
             {}
         )
+
 
         return state
 
@@ -1463,6 +1856,7 @@ def load_state():
             "STATE LOAD ERROR:",
             str(e)
         )
+
 
         return {
             "symbols": {}
@@ -1552,18 +1946,23 @@ def update_stage_memory(
 
 
     active_states = (
+
         "WATCH",
+
         "TREND_READY",
+
         "PRE-STRICT",
+
         "STRICT",
     )
 
 
     # ========================================================
-    # 新週期開始
+    # 新週期
     # ========================================================
 
     if (
+
         previous
         in (
             "NO_SIGNAL",
@@ -1572,12 +1971,14 @@ def update_stage_memory(
 
         and
 
-        status in active_states
+        status
+        in active_states
     ):
 
         reset_cycle(
             symbol_state
         )
+
 
         symbol_state[
             "current_price"
@@ -1593,6 +1994,7 @@ def update_stage_memory(
     # ========================================================
 
     if (
+
         status == "WATCH"
 
         and
@@ -1613,11 +2015,13 @@ def update_stage_memory(
 
 
     # ========================================================
-    # TREND_READY
+    # TREND READY
     # ========================================================
 
     if (
-        status == "TREND_READY"
+
+        status
+        == "TREND_READY"
 
         and
 
@@ -1637,11 +2041,13 @@ def update_stage_memory(
 
 
     # ========================================================
-    # PRE-STRICT
+    # PRE STRICT
     # ========================================================
 
     if (
-        status == "PRE-STRICT"
+
+        status
+        == "PRE-STRICT"
 
         and
 
@@ -1665,6 +2071,7 @@ def update_stage_memory(
     # ========================================================
 
     if (
+
         status == "STRICT"
 
         and
@@ -1783,7 +2190,7 @@ def stage_stats(
 
 
 # ============================================================
-# 階段價格文字
+# 階段顯示
 # ============================================================
 
 def build_stage_block(
@@ -1797,41 +2204,57 @@ def build_stage_block(
     lines = []
 
 
-    if s["watch"] is not None:
+    if (
+        s["watch"]
+        is not None
+    ):
 
         lines.append(
             "WATCH："
-            + price_text(
+            +
+            price_text(
                 s["watch"]
             )
         )
 
 
-    if s["trend"] is not None:
+    if (
+        s["trend"]
+        is not None
+    ):
 
         lines.append(
             "TREND_READY："
-            + price_text(
+            +
+            price_text(
                 s["trend"]
             )
         )
 
 
-    if s["pre"] is not None:
+    if (
+        s["pre"]
+        is not None
+    ):
 
         lines.append(
             "PRE-STRICT："
-            + price_text(
+            +
+            price_text(
                 s["pre"]
             )
         )
 
 
-    if s["strict"] is not None:
+    if (
+        s["strict"]
+        is not None
+    ):
 
         lines.append(
             "STRICT："
-            + price_text(
+            +
+            price_text(
                 s["strict"]
             )
         )
@@ -1839,7 +2262,8 @@ def build_stage_block(
 
     lines.append(
         "目前："
-        + price_text(
+        +
+        price_text(
             s["current"]
         )
     )
@@ -1848,41 +2272,57 @@ def build_stage_block(
     movement = []
 
 
-    if s["watch_to_now"] is not None:
+    if (
+        s["watch_to_now"]
+        is not None
+    ):
 
         movement.append(
             "WATCH→目前："
-            + pct_text(
+            +
+            pct_text(
                 s["watch_to_now"]
             )
         )
 
 
-    if s["trend_to_now"] is not None:
+    if (
+        s["trend_to_now"]
+        is not None
+    ):
 
         movement.append(
             "TREND_READY→目前："
-            + pct_text(
+            +
+            pct_text(
                 s["trend_to_now"]
             )
         )
 
 
-    if s["pre_to_now"] is not None:
+    if (
+        s["pre_to_now"]
+        is not None
+    ):
 
         movement.append(
             "PRE-STRICT→目前："
-            + pct_text(
+            +
+            pct_text(
                 s["pre_to_now"]
             )
         )
 
 
-    if s["strict_to_now"] is not None:
+    if (
+        s["strict_to_now"]
+        is not None
+    ):
 
         movement.append(
             "STRICT→目前："
-            + pct_text(
+            +
+            pct_text(
                 s["strict_to_now"]
             )
         )
@@ -1900,31 +2340,43 @@ def build_stage_block(
     transitions = []
 
 
-    if s["watch_to_trend"] is not None:
+    if (
+        s["watch_to_trend"]
+        is not None
+    ):
 
         transitions.append(
             "WATCH→TREND_READY："
-            + pct_text(
+            +
+            pct_text(
                 s["watch_to_trend"]
             )
         )
 
 
-    if s["trend_to_pre"] is not None:
+    if (
+        s["trend_to_pre"]
+        is not None
+    ):
 
         transitions.append(
             "TREND_READY→PRE-STRICT："
-            + pct_text(
+            +
+            pct_text(
                 s["trend_to_pre"]
             )
         )
 
 
-    if s["pre_to_strict"] is not None:
+    if (
+        s["pre_to_strict"]
+        is not None
+    ):
 
         transitions.append(
             "PRE-STRICT→STRICT："
-            + pct_text(
+            +
+            pct_text(
                 s["pre_to_strict"]
             )
         )
@@ -1945,7 +2397,7 @@ def build_stage_block(
 
 
 # ============================================================
-# 壓力位文字
+# 壓力顯示
 # ============================================================
 
 def build_resistance_block(r):
@@ -1970,14 +2422,14 @@ def build_resistance_block(r):
     if r4_price is None:
 
         r4_line = (
-            "最近4H壓力："
-            "目前區間內無明顯上方壓力"
+            "最近4H Swing壓力："
+            "未找到"
         )
 
     else:
 
         r4_line = (
-            "最近4H壓力："
+            "最近4H Swing壓力："
             f"{price_text(r4_price)} "
             f"({pct_text(r4_pct)})"
         )
@@ -1986,14 +2438,14 @@ def build_resistance_block(r):
     if r1d_price is None:
 
         d1_line = (
-            "最近1D壓力："
-            "目前區間內無明顯上方壓力"
+            "最近1D Swing壓力："
+            "未找到"
         )
 
     else:
 
         d1_line = (
-            "最近1D壓力："
+            "最近1D Swing壓力："
             f"{price_text(r1d_price)} "
             f"({pct_text(r1d_pct)})"
         )
@@ -2032,19 +2484,21 @@ def notify_signal(
     )
 
 
-    previous = symbol_state.get(
-        "status",
-        "UNKNOWN"
+    previous = (
+        symbol_state.get(
+            "status",
+            "UNKNOWN"
+        )
     )
 
 
     print(
         f"{base}: "
-        f"{previous} -> {status}"
+        f"{previous} -> "
+        f"{status}"
     )
 
 
-    # 先更新價格記憶
     update_stage_memory(
         r,
         symbol_state,
@@ -2053,7 +2507,10 @@ def notify_signal(
 
 
     # 同狀態不重複通知
-    if status == previous:
+    if (
+        status
+        == previous
+    ):
 
         symbol_state[
             "updated_utc"
@@ -2066,9 +2523,11 @@ def notify_signal(
         "4h_volume_ratio"
     )
 
+
     ratio_text = (
         f"{ratio:.2f}"
-        if ratio is not None
+        if ratio
+        is not None
         else "N/A"
     )
 
@@ -2097,6 +2556,7 @@ def notify_signal(
             symbol_state
         )
 
+
         chase = stats.get(
             "pre_to_strict"
         )
@@ -2104,6 +2564,7 @@ def notify_signal(
 
         send_ntfy(
             f"2560 STRICT {base}",
+
             (
                 f"{base} 正式 2560 STRICT\n"
                 f"Gate：{r['contract']}\n\n"
@@ -2126,19 +2587,22 @@ def notify_signal(
 
                 f"進入長壽多網格人工複核。"
             ),
+
             "high",
+
             "chart_with_upwards_trend,bell"
         )
 
 
     # ========================================================
-    # PRE-STRICT
+    # PRE STRICT
     # ========================================================
 
     elif status == "PRE-STRICT":
 
         send_ntfy(
             f"2560 PRE-STRICT {base}",
+
             (
                 f"{base} 進入 PRE-STRICT\n\n"
 
@@ -2159,19 +2623,22 @@ def notify_signal(
                 f"趨勢與量能已成熟，"
                 f"等待原版 Strict。"
             ),
+
             "high",
+
             "eyes,chart_with_upwards_trend"
         )
 
 
     # ========================================================
-    # TREND_READY
+    # TREND READY
     # ========================================================
 
     elif status == "TREND_READY":
 
         send_ntfy(
             f"2560 TREND READY {base}",
+
             (
                 f"{base} 進入 TREND_READY\n\n"
 
@@ -2190,7 +2657,9 @@ def notify_signal(
                 f"尚不是 Strict，"
                 f"開始人工注意。"
             ),
+
             "default",
+
             "eyes,chart_with_upwards_trend"
         )
 
@@ -2203,6 +2672,7 @@ def notify_signal(
 
         send_ntfy(
             f"2560 WATCH {base}",
+
             (
                 f"{base} 進入 WATCH\n\n"
 
@@ -2217,13 +2687,15 @@ def notify_signal(
 
                 f"先觀察。"
             ),
+
             "default",
+
             "eyes"
         )
 
 
     # ========================================================
-    # NO_SIGNAL
+    # NO SIGNAL
     # ========================================================
 
     elif status == "NO_SIGNAL":
@@ -2237,6 +2709,7 @@ def notify_signal(
 
             send_ntfy(
                 f"2560 signal invalid {base}",
+
                 (
                     f"{base} 2560 候選環境失效\n\n"
 
@@ -2250,7 +2723,9 @@ def notify_signal(
                     f"本輪歷史保留，"
                     f"新週期再重置。"
                 ),
+
                 "default",
+
                 "warning"
             )
 
@@ -2258,6 +2733,7 @@ def notify_signal(
     symbol_state[
         "status"
     ] = status
+
 
     symbol_state[
         "updated_utc"
@@ -2271,7 +2747,7 @@ def notify_signal(
 def main():
 
     print(
-        "2560 Cloud Monitor | v4.4"
+        "2560 Cloud Monitor | v4.5"
     )
 
     print(
@@ -2281,7 +2757,9 @@ def main():
 
     state = load_state()
 
-    contracts = discover_contracts()
+    contracts = (
+        discover_contracts()
+    )
 
 
     print(
@@ -2298,6 +2776,7 @@ def main():
 
 
     results = []
+
     errors = []
 
 
@@ -2308,15 +2787,18 @@ def main():
 
     for base in REQUESTED:
 
-        contract = contracts.get(
-            base
+        contract = (
+            contracts.get(
+                base
+            )
         )
 
 
         if not contract:
 
             print(
-                f"{base:<5} NOT_FOUND"
+                f"{base:<5} "
+                f"NOT_FOUND"
             )
 
             continue
@@ -2329,6 +2811,7 @@ def main():
                 contract
             )
 
+
             results.append(
                 r
             )
@@ -2336,13 +2819,13 @@ def main():
 
             if (
                 r["status"]
-                == "WAIT_HISTORY"
+                ==
+                "WAIT_HISTORY"
             ):
 
                 print(
                     f"{base:<5} "
                     f"WAIT_HISTORY "
-                    f"5m={r['bars_5m']} "
                     f"1H={r['bars_1h']} "
                     f"4H={r['bars_4h']} "
                     f"1D={r['bars_1d']}"
@@ -2355,9 +2838,11 @@ def main():
                 "4h_volume_ratio"
             )
 
+
             ratio_text = (
                 f"{ratio:.2f}"
-                if ratio is not None
+                if ratio
+                is not None
                 else "N/A"
             )
 
@@ -2369,7 +2854,7 @@ def main():
                 f"contract="
                 f"{contract:<18} "
 
-                f"now="
+                f"last="
                 f"{price_text(r['current_price'])} "
 
                 f"4Hclose="
@@ -2399,13 +2884,13 @@ def main():
                 f"1D="
                 f"{r['1d_confirm']} "
 
-                f"R4H="
+                f"Swing4H="
                 f"{price_text(r['resistance_4h'])} "
 
                 f"R4Hdist="
                 f"{pct_text(r['resistance_4h_pct'])} "
 
-                f"R1D="
+                f"Swing1D="
                 f"{price_text(r['resistance_1d'])} "
 
                 f"R1Ddist="
@@ -2427,6 +2912,7 @@ def main():
                     str(e)
                 )
             )
+
 
             print(
                 f"{base:<5} "
@@ -2453,6 +2939,7 @@ def main():
             "status",
             "UNKNOWN"
         )
+
 
         counts[status] = (
             counts.get(
