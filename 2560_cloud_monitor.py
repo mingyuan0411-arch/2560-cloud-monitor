@@ -1,1813 +1,149 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-
 """
-2560 Cloud Monitor v4.5
-=======================
+2560 Cloud Monitor v3.0 — PRE-STRICT Long-Life Grid
+===================================================
 
-狀態：
-NO_SIGNAL
-WATCH
-TREND_READY
-PRE-STRICT
-STRICT
+用途
+----
+1. 保留原 2560 STRICT 核心：
+   - 4H MA25 上升
+   - 4H Close > MA25
+   - 4H VolMA5 上穿 VolMA60
+   - 1D Close > MA25
+   - 1D MA25 上升
+   - 1D VolMA5 > VolMA60
+   - 20 根 4H 去重
 
-原版 STRICT 規則保持不變：
+2. 增加狀態：
+   NO_SIGNAL -> WATCH -> TREND_READY -> PRE-STRICT -> STRICT
 
-4H CORE
-- MA25 rising
-- Close > MA25
-- VolMA5 crosses above VolMA60
+3. PRE-STRICT 定義為「第一網可執行候選」：
+   - 4H 價格結構已成立
+   - 4H 放寬量能成立
+   - 1D 至少 soft-confirm
+   - 直接計算長壽多網格 A 的：
+     下沿 / 上沿 / 格數 / 等比 / 槓桿 / 首筆資金比例 /
+     單格估計 / 回撤容忍 / 強平安全要求
 
-1D confirmation
-- Close > MA25
-- MA25 rising
-- VolMA5 > VolMA60
+4. STRICT：
+   - 保留原嚴格訊號定義
+   - 若先前已有 PRE-STRICT，判斷是否適合另開第二網 B
+   - 不自動下單，只通知
 
-20-bar dedup
+5. 長壽網格原則：
+   - 生存 > 順趨勢 > 持續成交 > 短期報酬
+   - 下沿不能貼現價
+   - 依 ATR / 近期支撐動態放寬
+   - 強平價需由平台實際畫面確認，並明顯低於下沿
 
-v4.5：
-- 即時目前價改用 Gate futures ticker "last"
-- 不再用 5m close 當目前價
-- 4H 壓力改用 Swing High
-- 1D 壓力改用 Swing High
-- 保留階段價格記憶
-- 保留各階段 -> 目前漲跌幅
-- 保留 PRE-STRICT -> STRICT 追價幅度
-- STRICT 原始規則完全不動
-
-Public Gate data only.
-No API key.
-No orders.
+Public market data only. No API key. No order placement.
 """
 
 import json
+import math
 import os
 import re
 import time
 import urllib.parse
 import urllib.request
-
+from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from email.header import Header
-
-
-# ============================================================
-# 基本設定
-# ============================================================
 
 BASE = "https://api.gateio.ws/api/v4"
 
-VALIDATED = [
-    "BTC",
-    "ETH",
-    "XRP",
-    "SOL",
-    "BNB",
-]
-
+VALIDATED = ["BTC","ETH","XRP","SOL","BNB"]
 EXTENDED = [
-    "ADA",
-    "LTC",
-    "LINK",
-    "DOGE",
-    "SUI",
-    "HYPE",
-    "MU",
-    "VRT",
-    "DELL",
-    "NVDA",
-    "TSM",
-    "BRKB",
+    "ADA","LTC","LINK","DOGE","SUI","HYPE",
+    "MU","VRT","DELL","NVDA","TSM","BRKB"
 ]
-
 REQUESTED = VALIDATED + EXTENDED
 
+FOUR_H = 4 * 3600
+ONE_D = 24 * 3600
 
-# ============================================================
-# K線
-# ============================================================
-
-ONE_H = 60 * 60
-FOUR_H = 4 * 60 * 60
-ONE_D = 24 * 60 * 60
-
-LIMIT_1H = 220
-LIMIT_4H = 220
-LIMIT_1D = 160
-
+# 長壽網格需要更長的波動/支撐樣本
+LIMIT_4H = 600
+LIMIT_1D = 220
 DEDUP_BARS = 20
 
+# PRE-STRICT 放寬量能
+RELAXED_VOL_RATIO = 0.90
+RELAXED_VOL_GROWTH = 1.02
 
-# ============================================================
-# Swing High 設定
-# ============================================================
+# 1D soft confirmation，避免等到最嚴格才看到
+DAILY_SOFT_MA25_FLOOR = 0.97
 
-# 4H：
-# 前2根 + 後2根，中央最高才算局部壓力
-SWING_4H_LEFT = 2
-SWING_4H_RIGHT = 2
-SWING_4H_LOOKBACK = 60
+# STRICT 第二網追價限制
+STRICT_ADD_MAX_RISE_PCT = 3.0
 
-# 1D：
-# 日線雜訊比較少，但仍用前後2根
-SWING_1D_LEFT = 2
-SWING_1D_RIGHT = 2
-SWING_1D_LOOKBACK = 90
+# 長壽網格 A/B 建議資金比例
+PRE_STRICT_GRID_A_PCT = 60
+STRICT_GRID_B_PCT = 40
 
+# 長壽網格生存參數
+MIN_LOWER_LOW_VOL_PCT = 10.0
+MIN_LOWER_MED_VOL_PCT = 15.0
+MIN_LOWER_HIGH_VOL_PCT = 20.0
+MAX_LOWER_DISTANCE_PCT = 30.0
 
-# ============================================================
-# NTFY
-# ============================================================
+MIN_UPPER_LOW_VOL_PCT = 12.0
+MIN_UPPER_MED_VOL_PCT = 15.0
+MIN_UPPER_HIGH_VOL_PCT = 18.0
+MAX_UPPER_DISTANCE_PCT = 35.0
 
-NTFY_SERVER = os.getenv(
-    "NTFY_SERVER",
-    "https://ntfy.sh"
-).rstrip("/")
-
-NTFY_TOPIC = os.getenv(
-    "NTFY_TOPIC",
-    ""
-).strip()
-
-
-# ============================================================
-# State
-# ============================================================
+# 強平價要求：實際平台強平價至少再低於網格下沿 10%
+LIQ_BUFFER_BELOW_LOWER_PCT = 10.0
 
 STATE_DIR = Path(".monitor_state")
 STATE_FILE = STATE_DIR / "2560_state.json"
+RESULT_FILE = Path("2560_latest.json")
+
+NTFY_SERVER = os.getenv("NTFY_SERVER", "https://ntfy.sh").rstrip("/")
+NTFY_TOPIC = os.getenv("NTFY_TOPIC", "").strip()
 
 
 # ============================================================
-# 基礎工具
+# Basic helpers
 # ============================================================
 
 def now_iso():
-
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
-def iso(ts):
+def pct_change(a, b):
+    if a is None or b is None or a == 0:
+        return None
+    return (b / a - 1.0) * 100.0
 
-    return datetime.fromtimestamp(
-        ts,
-        timezone.utc
-    ).isoformat()
+
+def clamp(x, lo, hi):
+    return max(lo, min(hi, x))
+
+
+def price_text(x):
+    if x is None:
+        return "N/A"
+    if abs(x) >= 1000:
+        return f"{x:,.2f}"
+    if abs(x) >= 100:
+        return f"{x:.2f}"
+    if abs(x) >= 1:
+        return f"{x:.4f}"
+    return f"{x:.6f}"
+
+
+def pct_text(x):
+    return "N/A" if x is None else f"{x:+.2f}%"
 
 
 def norm(s):
+    return re.sub(r"[^A-Z0-9]", "", s.upper())
 
-    return re.sub(
-        r"[^A-Z0-9]",
-        "",
-        str(s).upper()
-    )
 
-
-def price_text(v):
-
-    if v is None:
-        return "N/A"
-
-    if abs(v) >= 100:
-        return f"{v:.2f}"
-
-    if abs(v) >= 10:
-        return f"{v:.3f}"
-
-    if abs(v) >= 1:
-        return f"{v:.4f}"
-
-    return f"{v:.6f}"
-
-
-def pct_change(
-    start_price,
-    end_price
-):
-
-    if (
-        start_price is None
-        or end_price is None
-        or start_price <= 0
-    ):
-        return None
-
-    return (
-        end_price
-        / start_price
-        - 1
-    ) * 100
-
-
-def pct_text(v):
-
-    if v is None:
-        return "N/A"
-
-    return f"{v:+.2f}%"
-
-
-# ============================================================
-# Gate API
-# ============================================================
-
-def gate_get(
-    path,
-    params=None,
-    retries=5
-):
-
-    params = params or {}
-
-    query = urllib.parse.urlencode(
-        params
-    )
-
-    url = BASE + path
-
-    if query:
-        url += "?" + query
-
-    last_error = None
-
-
-    for attempt in range(retries):
-
-        try:
-
-            req = urllib.request.Request(
-                url,
-                headers={
-                    "Accept": "application/json",
-                    "User-Agent":
-                        "2560-cloud-monitor/4.5",
-                }
-            )
-
-
-            with urllib.request.urlopen(
-                req,
-                timeout=30
-            ) as resp:
-
-                return json.load(
-                    resp
-                )
-
-
-        except Exception as e:
-
-            last_error = e
-
-            time.sleep(
-                min(
-                    2 ** attempt,
-                    8
-                )
-            )
-
-
-    raise RuntimeError(
-        f"Gate request failed: "
-        f"{last_error}"
-    )
-
-
-# ============================================================
-# 合約辨識
-# ============================================================
-
-def discover_contracts():
-
-    data = gate_get(
-        "/futures/usdt/contracts"
-    )
-
-    names = [
-        x.get("name", "")
-        for x in data
-        if x.get("name")
-    ]
-
-    normalized_names = {
-        norm(name): name
-        for name in names
-    }
-
-
-    aliases = {
-
-        "BRKB": [
-            "BRKB",
-            "BRKBG",
-            "BRK.B",
-        ],
-
-        "TSM": [
-            "TSM",
-            "TSMUS",
-        ],
-    }
-
-
-    mapping = {}
-
-
-    for base in REQUESTED:
-
-        candidates = [base]
-
-        candidates.extend(
-            aliases.get(
-                base,
-                []
-            )
-        )
-
-        found = None
-
-
-        for candidate in candidates:
-
-            possible = [
-                candidate,
-                candidate + "USDT",
-                candidate + "_USDT",
-            ]
-
-
-            for item in possible:
-
-                key = norm(
-                    item
-                )
-
-                if key in normalized_names:
-
-                    found = (
-                        normalized_names[
-                            key
-                        ]
-                    )
-
-                    break
-
-
-            if found:
-                break
-
-
-        mapping[base] = found
-
-
-    return mapping
-
-
-# ============================================================
-# 真實目前價
-# Gate futures ticker last
-# ============================================================
-
-def fetch_last_price(
-    contract
-):
-
-    data = gate_get(
-        "/futures/usdt/tickers",
-        {
-            "contract":
-                contract
-        }
-    )
-
-
-    if (
-        not isinstance(
-            data,
-            list
-        )
-        or
-        len(data) == 0
-    ):
-
-        raise RuntimeError(
-            f"No ticker data "
-            f"for {contract}"
-        )
-
-
-    ticker = data[0]
-
-    last = ticker.get(
-        "last"
-    )
-
-
-    if last in (
-        None,
-        "",
-    ):
-
-        raise RuntimeError(
-            f"No last price "
-            f"for {contract}"
-        )
-
-
-    return float(
-        last
-    )
-
-
-# ============================================================
-# K線
-# ============================================================
-
-def fetch(
-    contract,
-    interval,
-    limit
-):
-
-    raw = gate_get(
-        "/futures/usdt/candlesticks",
-        {
-            "contract":
-                contract,
-
-            "interval":
-                interval,
-
-            "limit":
-                limit,
-        }
-    )
-
-
-    rows = []
-
-
-    for x in raw:
-
-        rows.append({
-
-            "t":
-                int(
-                    x["t"]
-                ),
-
-            "o":
-                float(
-                    x["o"]
-                ),
-
-            "h":
-                float(
-                    x["h"]
-                ),
-
-            "l":
-                float(
-                    x["l"]
-                ),
-
-            "c":
-                float(
-                    x["c"]
-                ),
-
-            "v":
-                float(
-                    x.get(
-                        "v",
-                        0
-                    )
-                ),
-        })
-
-
-    rows.sort(
-        key=lambda z:
-            z["t"]
-    )
-
-
-    return rows
-
-
-def completed_only(
-    rows,
-    seconds,
-    now_ts
-):
-
-    return [
-        r
-        for r in rows
-        if (
-            r["t"]
-            + seconds
-            <= now_ts
-        )
-    ]
-
-
-# ============================================================
-# 均線
-# ============================================================
-
-def sma(
-    values,
-    n,
-    i
-):
-
-    if i + 1 < n:
-        return None
-
-    return (
-        sum(
-            values[
-                i - n + 1:
-                i + 1
-            ]
-        )
-        / n
-    )
-
-
-def add_indicators(
-    rows,
-    seconds
-):
-
-    closes = [
-        r["c"]
-        for r in rows
-    ]
-
-    volumes = [
-        r["v"]
-        for r in rows
-    ]
-
-
-    for i, r in enumerate(rows):
-
-        r["i"] = i
-
-
-        r["ma5"] = sma(
-            closes,
-            5,
-            i
-        )
-
-        r["ma10"] = sma(
-            closes,
-            10,
-            i
-        )
-
-        r["ma20"] = sma(
-            closes,
-            20,
-            i
-        )
-
-        r["ma25"] = sma(
-            closes,
-            25,
-            i
-        )
-
-        r["ma60"] = sma(
-            closes,
-            60,
-            i
-        )
-
-
-        r["ma25_prev"] = (
-            sma(
-                closes,
-                25,
-                i - 1
-            )
-            if i >= 25
-            else None
-        )
-
-
-        r["vma5"] = sma(
-            volumes,
-            5,
-            i
-        )
-
-        r["vma60"] = sma(
-            volumes,
-            60,
-            i
-        )
-
-
-        r["vma5_prev"] = (
-            sma(
-                volumes,
-                5,
-                i - 1
-            )
-            if i >= 5
-            else None
-        )
-
-
-        r["vma60_prev"] = (
-            sma(
-                volumes,
-                60,
-                i - 1
-            )
-            if i >= 60
-            else None
-        )
-
-
-        r["close_t"] = (
-            r["t"]
-            + seconds
-        )
-
-
-# ============================================================
-# 1H 多頭確認
-# ============================================================
-
-def one_hour_confirm(r):
-
-    needed = [
-        r.get("ma5"),
-        r.get("ma10"),
-        r.get("ma20"),
-    ]
-
-
-    if any(
-        x is None
-        for x in needed
-    ):
-
-        return False
-
-
-    return (
-        r["c"]
-        > r["ma20"]
-
-        and
-
-        r["ma5"]
-        > r["ma10"]
-
-        and
-
-        r["ma10"]
-        > r["ma20"]
-    )
-
-
-# ============================================================
-# 4H 正式結構
-# ============================================================
-
-def four_hour_structure(r):
-
-    if (
-        r.get("ma25")
-        is None
-
-        or
-
-        r.get("ma25_prev")
-        is None
-    ):
-
-        return False
-
-
-    return (
-        r["ma25"]
-        > r["ma25_prev"]
-
-        and
-
-        r["c"]
-        > r["ma25"]
-    )
-
-
-# ============================================================
-# 4H Early
-# ============================================================
-
-def four_hour_early(r):
-
-    if (
-        r.get("ma25")
-        is None
-
-        or
-
-        r.get("ma25_prev")
-        is None
-    ):
-
-        return False
-
-
-    price_ok = (
-        r["c"]
-        > r["ma25"]
-    )
-
-
-    slope_ok = (
-        r["ma25"]
-        >= r["ma25_prev"]
-    )
-
-
-    return (
-        price_ok
-        or
-        slope_ok
-    )
-
-
-# ============================================================
-# 4H Relaxed Volume
-# ============================================================
-
-def relaxed_volume_ok(r):
-
-    needed = [
-        r.get("vma5"),
-        r.get("vma60"),
-        r.get("vma5_prev"),
-    ]
-
-
-    if any(
-        x is None
-        for x in needed
-    ):
-
-        return False
-
-
-    near_long_volume = (
-        r["vma5"]
-        >=
-        r["vma60"]
-        * 0.90
-    )
-
-
-    volume_rising = (
-        r["vma5"]
-        >
-        r["vma5_prev"]
-        * 1.02
-    )
-
-
-    return (
-        near_long_volume
-        or
-        volume_rising
-    )
-
-
-# ============================================================
-# 原版 4H STRICT CORE
-# 完全不改
-# ============================================================
-
-def core_ok(r):
-
-    needed = [
-        r.get("ma25"),
-        r.get("ma25_prev"),
-        r.get("vma5"),
-        r.get("vma60"),
-        r.get("vma5_prev"),
-        r.get("vma60_prev"),
-    ]
-
-
-    if any(
-        x is None
-        for x in needed
-    ):
-
-        return False
-
-
-    return (
-
-        r["ma25"]
-        > r["ma25_prev"]
-
-        and
-
-        r["c"]
-        > r["ma25"]
-
-        and
-
-        r["vma5_prev"]
-        <= r["vma60_prev"]
-
-        and
-
-        r["vma5"]
-        > r["vma60"]
-    )
-
-
-# ============================================================
-# 原版 1D STRICT
-# 完全不改
-# ============================================================
-
-def daily_confirm(r):
-
-    if r is None:
-        return False
-
-
-    needed = [
-        r.get("ma25"),
-        r.get("ma25_prev"),
-        r.get("vma5"),
-        r.get("vma60"),
-    ]
-
-
-    if any(
-        x is None
-        for x in needed
-    ):
-
-        return False
-
-
-    return (
-
-        r["c"]
-        > r["ma25"]
-
-        and
-
-        r["ma25"]
-        > r["ma25_prev"]
-
-        and
-
-        r["vma5"]
-        > r["vma60"]
-    )
-
-
-# ============================================================
-# 1D Soft
-# ============================================================
-
-def daily_soft_confirm(r):
-
-    if r is None:
-        return False
-
-
-    if r.get(
-        "ma25"
-    ) is None:
-
-        return False
-
-
-    return (
-        r["c"]
-        >=
-        r["ma25"]
-        * 0.97
-    )
-
-
-# ============================================================
-# Daily Alignment
-# ============================================================
-
-def last_completed_daily_asof(
-    daily,
-    close_t
-):
-
-    ans = None
-
-
-    for r in daily:
-
-        if (
-            r["close_t"]
-            <= close_t
-        ):
-
-            ans = r
-
-        else:
-
-            break
-
-
-    return ans
-
-
-# ============================================================
-# STRICT History
-# ============================================================
-
-def strict_raw_at(
-    r4,
-    daily
-):
-
-    d = (
-        last_completed_daily_asof(
-            daily,
-            r4["close_t"]
-        )
-    )
-
-
-    return (
-        core_ok(r4)
-
-        and
-
-        daily_confirm(d)
-    )
-
-
-def kept_strict(
-    r4,
-    daily
-):
-
-    raw = []
-
-
-    for r in r4:
-
-        if strict_raw_at(
-            r,
-            daily
-        ):
-
-            raw.append(r)
-
-
-    kept = []
-
-    last_i = -10**9
-
-
-    for r in raw:
-
-        if (
-            r["i"]
-            - last_i
-            >= DEDUP_BARS
-        ):
-
-            kept.append(r)
-
-            last_i = r["i"]
-
-
-    return kept
-
-
-# ============================================================
-# Swing High
-#
-# 中間K必須高於：
-# 左邊 N 根
-# 右邊 N 根
-#
-# 才是真正局部波段高點
-# ============================================================
-
-def find_swing_highs(
-    rows,
-    left=2,
-    right=2
-):
-
-    swings = []
-
-
-    if (
-        len(rows)
-        <
-        left
-        + right
-        + 1
-    ):
-
-        return swings
-
-
-    for i in range(
-        left,
-        len(rows) - right
-    ):
-
-        center = rows[i]
-
-        center_high = center["h"]
-
-
-        left_highs = [
-            rows[j]["h"]
-            for j in range(
-                i - left,
-                i
-            )
-        ]
-
-
-        right_highs = [
-            rows[j]["h"]
-            for j in range(
-                i + 1,
-                i + right + 1
-            )
-        ]
-
-
-        higher_than_left = all(
-            center_high
-            >
-            x
-            for x in left_highs
-        )
-
-
-        higher_than_right = all(
-            center_high
-            >=
-            x
-            for x in right_highs
-        )
-
-
-        if (
-            higher_than_left
-
-            and
-
-            higher_than_right
-        ):
-
-            swings.append({
-                "index":
-                    i,
-
-                "time":
-                    center["t"],
-
-                "price":
-                    center_high,
-            })
-
-
-    return swings
-
-
-# ============================================================
-# 找目前價上方最近 Swing High
-# ============================================================
-
-def find_nearest_swing_resistance(
-    rows,
-    current_price,
-    lookback,
-    left,
-    right
-):
-
-    if (
-        current_price is None
-        or
-        current_price <= 0
-    ):
-
-        return None
-
-
-    subset = rows[
-        -lookback:
-    ]
-
-
-    swings = find_swing_highs(
-        subset,
-        left=left,
-        right=right
-    )
-
-
-    above = [
-        s
-        for s in swings
-        if (
-            s["price"]
-            > current_price
-        )
-    ]
-
-
-    if not above:
-
-        return None
-
-
-    # 找「價格上」距離最近的真正波段高點
-    nearest = min(
-        above,
-        key=lambda s:
-            s["price"]
-    )
-
-
-    return nearest
-
-
-# ============================================================
-# 壓力距離
-# ============================================================
-
-def resistance_distance(
-    current_price,
-    resistance_price
-):
-
-    if (
-        current_price is None
-        or
-        resistance_price is None
-        or
-        current_price <= 0
-    ):
-
-        return None
-
-
-    return (
-        resistance_price
-        / current_price
-        - 1
-    ) * 100
-
-
-# ============================================================
-# 單一標的分析
-# ============================================================
-
-def analyze(
-    base,
-    contract
-):
-
-    now_ts = int(
-        datetime.now(
-            timezone.utc
-        ).timestamp()
-    )
-
-
-    # ========================================================
-    # 真正即時成交價
-    # ========================================================
-
-    current_price = (
-        fetch_last_price(
-            contract
-        )
-    )
-
-
-    # ========================================================
-    # K線
-    # ========================================================
-
-    r1 = completed_only(
-        fetch(
-            contract,
-            "1h",
-            LIMIT_1H
-        ),
-        ONE_H,
-        now_ts
-    )
-
-
-    r4 = completed_only(
-        fetch(
-            contract,
-            "4h",
-            LIMIT_4H
-        ),
-        FOUR_H,
-        now_ts
-    )
-
-
-    rd = completed_only(
-        fetch(
-            contract,
-            "1d",
-            LIMIT_1D
-        ),
-        ONE_D,
-        now_ts
-    )
-
-
-    if (
-        len(r1) < 65
-        or
-        len(r4) < 65
-        or
-        len(rd) < 65
-    ):
-
-        return {
-
-            "base":
-                base,
-
-            "contract":
-                contract,
-
-            "group":
-                "VALIDATED"
-                if base
-                in VALIDATED
-                else "EXTENDED",
-
-            "status":
-                "WAIT_HISTORY",
-
-            "bars_1h":
-                len(r1),
-
-            "bars_4h":
-                len(r4),
-
-            "bars_1d":
-                len(rd),
-        }
-
-
-    add_indicators(
-        r1,
-        ONE_H
-    )
-
-    add_indicators(
-        r4,
-        FOUR_H
-    )
-
-    add_indicators(
-        rd,
-        ONE_D
-    )
-
-
-    latest1 = r1[-1]
-
-    previous1 = r1[-2]
-
-    latest4 = r4[-1]
-
-
-    latest_d = (
-        last_completed_daily_asof(
-            rd,
-            latest4["close_t"]
-        )
-    )
-
-
-    # ========================================================
-    # 1H
-    # ========================================================
-
-    oneh_now = (
-        one_hour_confirm(
-            latest1
-        )
-    )
-
-
-    oneh_prev = (
-        one_hour_confirm(
-            previous1
-        )
-    )
-
-
-    oneh_fresh = (
-        oneh_now
-        and
-        not oneh_prev
-    )
-
-
-    # ========================================================
-    # 4H
-    # ========================================================
-
-    h4_structure = (
-        four_hour_structure(
-            latest4
-        )
-    )
-
-
-    h4_early = (
-        four_hour_early(
-            latest4
-        )
-    )
-
-
-    relaxed_volume = (
-        relaxed_volume_ok(
-            latest4
-        )
-    )
-
-
-    h4_core = (
-        core_ok(
-            latest4
-        )
-    )
-
-
-    # ========================================================
-    # 1D
-    # ========================================================
-
-    day_strict = (
-        daily_confirm(
-            latest_d
-        )
-    )
-
-
-    day_soft = (
-        daily_soft_confirm(
-            latest_d
-        )
-    )
-
-
-    # ========================================================
-    # STRICT
-    # ========================================================
-
-    strict_raw = (
-        h4_core
-        and
-        day_strict
-    )
-
-
-    strict_kept = (
-        kept_strict(
-            r4,
-            rd
-        )
-    )
-
-
-    strict_now = (
-
-        bool(
-            strict_kept
-        )
-
-        and
-
-        strict_kept[-1]["t"]
-        ==
-        latest4["t"]
-    )
-
-
-    # ========================================================
-    # PRE-STRICT
-    # ========================================================
-
-    pre_strict = (
-
-        not strict_now
-
-        and
-
-        oneh_now
-
-        and
-
-        h4_structure
-
-        and
-
-        relaxed_volume
-
-        and
-
-        day_strict
-    )
-
-
-    # ========================================================
-    # TREND_READY
-    # ========================================================
-
-    trend_ready = (
-
-        not strict_now
-
-        and
-
-        not pre_strict
-
-        and
-
-        oneh_now
-
-        and
-
-        h4_early
-
-        and
-
-        relaxed_volume
-
-        and
-
-        day_soft
-    )
-
-
-    # ========================================================
-    # WATCH
-    # ========================================================
-
-    watch = (
-
-        not strict_now
-
-        and
-
-        not pre_strict
-
-        and
-
-        not trend_ready
-
-        and
-
-        oneh_now
-    )
-
-
-    # ========================================================
-    # STATUS
-    # ========================================================
-
-    if strict_now:
-
-        status = "STRICT"
-
-    elif pre_strict:
-
-        status = "PRE-STRICT"
-
-    elif trend_ready:
-
-        status = "TREND_READY"
-
-    elif watch:
-
-        status = "WATCH"
-
-    else:
-
-        status = "NO_SIGNAL"
-
-
-    # ========================================================
-    # Volume Ratio
-    # ========================================================
-
-    volume_ratio = None
-
-
-    if (
-        latest4.get(
-            "vma5"
-        )
-        is not None
-
-        and
-
-        latest4.get(
-            "vma60"
-        )
-        not in (
-            None,
-            0
-        )
-    ):
-
-        volume_ratio = (
-            latest4["vma5"]
-            /
-            latest4["vma60"]
-        )
-
-
-    # ========================================================
-    # 4H Swing Resistance
-    # ========================================================
-
-    swing_4h = (
-        find_nearest_swing_resistance(
-            r4,
-            current_price,
-            SWING_4H_LOOKBACK,
-            SWING_4H_LEFT,
-            SWING_4H_RIGHT
-        )
-    )
-
-
-    resistance_4h = (
-        swing_4h["price"]
-        if swing_4h
-        else None
-    )
-
-
-    resistance_4h_time = (
-        swing_4h["time"]
-        if swing_4h
-        else None
-    )
-
-
-    resistance_4h_pct = (
-        resistance_distance(
-            current_price,
-            resistance_4h
-        )
-    )
-
-
-    # ========================================================
-    # 1D Swing Resistance
-    # ========================================================
-
-    swing_1d = (
-        find_nearest_swing_resistance(
-            rd,
-            current_price,
-            SWING_1D_LOOKBACK,
-            SWING_1D_LEFT,
-            SWING_1D_RIGHT
-        )
-    )
-
-
-    resistance_1d = (
-        swing_1d["price"]
-        if swing_1d
-        else None
-    )
-
-
-    resistance_1d_time = (
-        swing_1d["time"]
-        if swing_1d
-        else None
-    )
-
-
-    resistance_1d_pct = (
-        resistance_distance(
-            current_price,
-            resistance_1d
-        )
-    )
-
-
-    return {
-
-        "base":
-            base,
-
-        "contract":
-            contract,
-
-        "group":
-            "VALIDATED"
-            if base
-            in VALIDATED
-            else "EXTENDED",
-
-        "status":
-            status,
-
-
-        # 真正 ticker last
-        "current_price":
-            current_price,
-
-
-        "latest_4h_close":
-            latest4["c"],
-
-
-        "1h_confirm":
-            oneh_now,
-
-        "1h_fresh":
-            oneh_fresh,
-
-        "4h_early":
-            h4_early,
-
-        "4h_structure":
-            h4_structure,
-
-        "4h_volume_relaxed":
-            relaxed_volume,
-
-        "4h_volume_ratio":
-            volume_ratio,
-
-        "4h_core":
-            h4_core,
-
-        "1d_soft":
-            day_soft,
-
-        "1d_confirm":
-            day_strict,
-
-        "strict_raw":
-            strict_raw,
-
-        "strict":
-            strict_now,
-
-
-        # Swing High 壓力
-        "resistance_4h":
-            resistance_4h,
-
-        "resistance_4h_pct":
-            resistance_4h_pct,
-
-        "resistance_4h_time":
-            resistance_4h_time,
-
-        "resistance_1d":
-            resistance_1d,
-
-        "resistance_1d_pct":
-            resistance_1d_pct,
-
-        "resistance_1d_time":
-            resistance_1d_time,
-
-
-        "latest_1h_open_utc":
-            iso(
-                latest1["t"]
-            ),
-
-        "latest_4h_open_utc":
-            iso(
-                latest4["t"]
-            ),
-    }
-
-
-# ============================================================
-# NTFY
-# ============================================================
-
-def send_ntfy(
-    title,
-    msg,
-    priority="default",
-    tags="bell"
-):
-
-    if not NTFY_TOPIC:
-
-        print(
-            "NTFY_TOPIC 未設定"
-        )
-
-        return False
-
-
-    safe_title = str(
-        Header(
-            title,
-            "utf-8"
-        )
-    )
-
-
-    req = urllib.request.Request(
-
-        f"{NTFY_SERVER}/{NTFY_TOPIC}",
-
-        data=msg.encode(
-            "utf-8"
-        ),
-
-        method="POST",
-
-        headers={
-
-            "Title":
-                safe_title,
-
-            "Priority":
-                priority,
-
-            "Tags":
-                tags,
-
-            "Content-Type":
-                "text/plain; "
-                "charset=utf-8",
-        }
-    )
-
-
-    try:
-
-        with urllib.request.urlopen(
-            req,
-            timeout=20
-        ) as resp:
-
-            print(
-                "NTFY:",
-                resp.status,
-                title
-            )
-
-            return True
-
-
-    except Exception as e:
-
-        print(
-            "NTFY ERROR:",
-            title,
-            str(e)
-        )
-
-        return False
+def iso(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).isoformat()
 
 
 # ============================================================
@@ -1815,1155 +151,755 @@ def send_ntfy(
 # ============================================================
 
 def load_state():
-
-    STATE_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
     if not STATE_FILE.exists():
-
-        return {
-            "symbols": {}
-        }
-
-
+        return {"symbols": {}, "last_summary_utc": None}
     try:
-
-        with STATE_FILE.open(
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            state = json.load(
-                f
-            )
-
-
-        state.setdefault(
-            "symbols",
-            {}
-        )
-
-
-        return state
-
-
-    except Exception as e:
-
-        print(
-            "STATE LOAD ERROR:",
-            str(e)
-        )
-
-
-        return {
-            "symbols": {}
-        }
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"symbols": {}, "last_summary_utc": None}
 
 
 def save_state(state):
-
-    STATE_DIR.mkdir(
-        parents=True,
-        exist_ok=True
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
 
-    with STATE_FILE.open(
-        "w",
-        encoding="utf-8"
-    ) as f:
+# ============================================================
+# Gate API
+# ============================================================
 
-        json.dump(
-            state,
-            f,
-            ensure_ascii=False,
-            indent=2
-        )
+def gate_get(path, params=None, retries=5):
+    params = params or {}
+    qs = urllib.parse.urlencode(params)
+    url = BASE + path + (("?" + qs) if qs else "")
+    last = None
+
+    for k in range(retries):
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "2560-cloud-monitor/3.0",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.load(r)
+        except Exception as e:
+            last = e
+            time.sleep(min(2 ** k, 8))
+
+    raise RuntimeError(f"Gate request failed: {last}")
+
+
+def discover_contracts():
+    data = gate_get("/futures/usdt/contracts")
+    names = [x.get("name", "") for x in data if x.get("name")]
+
+    mapping = {}
+    aliases = {
+        "BRKB": ["BRKB", "BRKBG", "BRKBUS", "BRK.B"],
+        "TSM": ["TSM", "TSMUS"],
+    }
+
+    for base in REQUESTED:
+        candidates_base = aliases.get(base, [base])
+
+        found = None
+        for alias in candidates_base:
+            target = norm(alias + "USDT")
+            exact = [n for n in names if norm(n) == target]
+            if exact:
+                found = exact[0]
+                break
+
+        if found is None:
+            for alias in candidates_base:
+                for n in names:
+                    nn = norm(n)
+                    if nn.endswith("USDT") and nn[:-4] == norm(alias):
+                        found = n
+                        break
+                if found:
+                    break
+
+        mapping[base] = found
+
+    return mapping
+
+
+def fetch(contract, interval, limit):
+    raw = gate_get(
+        "/futures/usdt/candlesticks",
+        {
+            "contract": contract,
+            "interval": interval,
+            "limit": limit,
+        },
+    )
+
+    rows = []
+    for x in raw:
+        rows.append({
+            "t": int(float(x["t"])),
+            "o": float(x["o"]),
+            "h": float(x["h"]),
+            "l": float(x["l"]),
+            "c": float(x["c"]),
+            "v": float(x.get("v", 0)),
+        })
+
+    rows.sort(key=lambda z: z["t"])
+    return rows
+
+
+def completed_only(rows, step, cutoff=None):
+    if cutoff is None:
+        cutoff = int(datetime.now(timezone.utc).timestamp())
+    return [r for r in rows if r["t"] + step <= cutoff]
 
 
 # ============================================================
-# 新週期清除
+# Indicators
 # ============================================================
 
-def reset_cycle(
-    symbol_state
-):
+def sma(vals, n, i):
+    if i < 0 or i + 1 < n:
+        return None
+    return sum(vals[i - n + 1:i + 1]) / n
 
-    keys = [
 
-        "watch_price",
-        "watch_time",
+def true_range(rows, i):
+    r = rows[i]
+    if i == 0:
+        return r["h"] - r["l"]
+    prev_close = rows[i - 1]["c"]
+    return max(
+        r["h"] - r["l"],
+        abs(r["h"] - prev_close),
+        abs(r["l"] - prev_close),
+    )
 
-        "trend_ready_price",
-        "trend_ready_time",
 
-        "pre_strict_price",
-        "pre_strict_time",
+def atr(rows, n, i):
+    if i + 1 < n:
+        return None
+    vals = [true_range(rows, j) for j in range(i - n + 1, i + 1)]
+    return sum(vals) / n
 
-        "strict_price",
-        "strict_time",
 
-        "current_price",
-        "current_time",
+def add_ind(rows, step):
+    closes = [r["c"] for r in rows]
+    vols = [r["v"] for r in rows]
+
+    for i, r in enumerate(rows):
+        r["i"] = i
+        r["ma25"] = sma(closes, 25, i)
+        r["ma25_prev"] = sma(closes, 25, i - 1)
+        r["vma5"] = sma(vols, 5, i)
+        r["vma60"] = sma(vols, 60, i)
+        r["vma5_prev"] = sma(vols, 5, i - 1)
+        r["vma60_prev"] = sma(vols, 60, i - 1)
+        r["atr14"] = atr(rows, 14, i)
+        r["close_t"] = r["t"] + step
+
+
+# ============================================================
+# 2560 signal logic
+# ============================================================
+
+def structure_4h_ok(r):
+    need = [r.get("ma25"), r.get("ma25_prev")]
+    if any(x is None for x in need):
+        return False
+    return r["ma25"] > r["ma25_prev"] and r["c"] > r["ma25"]
+
+
+def relaxed_volume_ok(r):
+    need = [r.get("vma5"), r.get("vma60"), r.get("vma5_prev")]
+    if any(x is None for x in need):
+        return False
+    return (
+        r["vma5"] >= r["vma60"] * RELAXED_VOL_RATIO
+        or r["vma5"] > r["vma5_prev"] * RELAXED_VOL_GROWTH
+    )
+
+
+def core_ok(r):
+    need = [
+        r.get("ma25"),
+        r.get("ma25_prev"),
+        r.get("vma5"),
+        r.get("vma60"),
+        r.get("vma5_prev"),
+        r.get("vma60_prev"),
     ]
+    if any(x is None for x in need):
+        return False
+
+    return (
+        r["ma25"] > r["ma25_prev"]
+        and r["c"] > r["ma25"]
+        and r["vma5_prev"] <= r["vma60_prev"]
+        and r["vma5"] > r["vma60"]
+    )
 
 
-    for key in keys:
+def daily_soft_ok(r):
+    if r is None:
+        return False
+    need = [r.get("ma25"), r.get("ma25_prev")]
+    if any(x is None for x in need):
+        return False
 
-        symbol_state.pop(
-            key,
-            None
-        )
+    return (
+        r["c"] >= r["ma25"] * DAILY_SOFT_MA25_FLOOR
+        and r["ma25"] >= r["ma25_prev"]
+    )
+
+
+def daily_ok(r):
+    if r is None:
+        return False
+
+    need = [r.get("ma25"), r.get("ma25_prev"), r.get("vma5"), r.get("vma60")]
+    if any(x is None for x in need):
+        return False
+
+    return (
+        r["c"] > r["ma25"]
+        and r["ma25"] > r["ma25_prev"]
+        and r["vma5"] > r["vma60"]
+    )
+
+
+def last_completed_daily_asof(daily, close_t):
+    ans = None
+    for r in daily:
+        if r["close_t"] <= close_t:
+            ans = r
+        else:
+            break
+    return ans
+
+
+def strict_raw_at(r4, rd):
+    d = last_completed_daily_asof(rd, r4["close_t"])
+    return core_ok(r4) and daily_ok(d), d
+
+
+def kept_strict(r4, rd):
+    raw = []
+    for r in r4:
+        ok, _ = strict_raw_at(r, rd)
+        if ok:
+            raw.append(r)
+
+    kept = []
+    last_i = -10**9
+    for r in raw:
+        if r["i"] - last_i >= DEDUP_BARS:
+            kept.append(r)
+            last_i = r["i"]
+
+    return kept
+
+
+def classify_status(latest, d, strict_now):
+    s4 = structure_4h_ok(latest)
+    rv = relaxed_volume_ok(latest)
+    dsoft = daily_soft_ok(d)
+    dstrict = daily_ok(d)
+
+    if strict_now:
+        return "STRICT"
+
+    # PRE-STRICT: 價格結構 + 放寬量能 + 日線至少 soft
+    if s4 and rv and dsoft:
+        return "PRE-STRICT"
+
+    # TREND_READY: 4H 結構 + 日線 soft，但量能還沒跟上
+    if s4 and dsoft:
+        return "TREND_READY"
+
+    # WATCH: 4H 或日線已有一邊轉好
+    if s4 or dsoft:
+        return "WATCH"
+
+    return "NO_SIGNAL"
 
 
 # ============================================================
-# 階段價格記憶
+# Long-life grid model
 # ============================================================
 
-def update_stage_memory(
-    r,
-    symbol_state,
-    previous
-):
-
-    status = r["status"]
-
-    current_price = r[
-        "current_price"
-    ]
+def recent_low(rows, bars):
+    subset = rows[-bars:] if len(rows) >= bars else rows
+    return min((r["l"] for r in subset), default=None)
 
 
-    symbol_state[
-        "current_price"
-    ] = current_price
-
-    symbol_state[
-        "current_time"
-    ] = now_iso()
+def recent_high(rows, bars):
+    subset = rows[-bars:] if len(rows) >= bars else rows
+    return max((r["h"] for r in subset), default=None)
 
 
-    active_states = (
+def vol_profile(atr_pct):
+    if atr_pct is None:
+        return "MEDIUM"
+    if atr_pct < 2.0:
+        return "LOW"
+    if atr_pct < 4.0:
+        return "MEDIUM"
+    return "HIGH"
 
-        "WATCH",
 
-        "TREND_READY",
+def longlife_grid_plan(r4, current_price, capital_pct):
+    """
+    生存優先的趨勢長壽多網格。
+    不把下沿硬貼在現價附近。
+    """
+    latest = r4[-1]
+    atr14 = latest.get("atr14")
+    atr_pct = None
+    if atr14 is not None and current_price:
+        atr_pct = atr14 / current_price * 100.0
 
-        "PRE-STRICT",
+    profile = vol_profile(atr_pct)
 
-        "STRICT",
+    if profile == "LOW":
+        min_lower = MIN_LOWER_LOW_VOL_PCT
+        min_upper = MIN_UPPER_LOW_VOL_PCT
+        per_grid_target = 0.8
+        leverage = 3
+    elif profile == "MEDIUM":
+        min_lower = MIN_LOWER_MED_VOL_PCT
+        min_upper = MIN_UPPER_MED_VOL_PCT
+        per_grid_target = 1.0
+        leverage = 3
+    else:
+        min_lower = MIN_LOWER_HIGH_VOL_PCT
+        min_upper = MIN_UPPER_HIGH_VOL_PCT
+        per_grid_target = 1.2
+        leverage = 2
+
+    # ATR 越大，下沿越深。4 x 4H ATR 作基本壓力緩衝。
+    atr_lower = (atr_pct or 0.0) * 4.0
+    lower_distance = clamp(
+        max(min_lower, atr_lower),
+        min_lower,
+        MAX_LOWER_DISTANCE_PCT,
     )
 
+    # 30天約 180 根 4H；60天約 360 根。
+    support_30d = recent_low(r4, 180)
+    support_60d = recent_low(r4, 360)
 
-    # ========================================================
-    # 新週期
-    # ========================================================
+    pct_floor = current_price * (1.0 - lower_distance / 100.0)
 
-    if (
+    support_candidates = [x for x in [support_30d, support_60d] if x is not None]
+    support_floor = min(support_candidates) if support_candidates else pct_floor
 
-        previous
-        in (
-            "NO_SIGNAL",
-            "UNKNOWN"
-        )
+    # 支撐若更低，採更保守者；但避免無限拉寬，最多約 -30%
+    absolute_lower_cap = current_price * (1.0 - MAX_LOWER_DISTANCE_PCT / 100.0)
+    lower = min(pct_floor, support_floor * 0.995)
+    lower = max(lower, absolute_lower_cap)
 
-        and
+    actual_lower_pct = abs(pct_change(current_price, lower) or 0.0)
 
-        status
-        in active_states
-    ):
-
-        reset_cycle(
-            symbol_state
-        )
-
-
-        symbol_state[
-            "current_price"
-        ] = current_price
-
-        symbol_state[
-            "current_time"
-        ] = now_iso()
-
-
-    # ========================================================
-    # WATCH
-    # ========================================================
-
-    if (
-
-        status == "WATCH"
-
-        and
-
-        symbol_state.get(
-            "watch_price"
-        )
-        is None
-    ):
-
-        symbol_state[
-            "watch_price"
-        ] = current_price
-
-        symbol_state[
-            "watch_time"
-        ] = now_iso()
-
-
-    # ========================================================
-    # TREND READY
-    # ========================================================
-
-    if (
-
-        status
-        == "TREND_READY"
-
-        and
-
-        symbol_state.get(
-            "trend_ready_price"
-        )
-        is None
-    ):
-
-        symbol_state[
-            "trend_ready_price"
-        ] = current_price
-
-        symbol_state[
-            "trend_ready_time"
-        ] = now_iso()
-
-
-    # ========================================================
-    # PRE STRICT
-    # ========================================================
-
-    if (
-
-        status
-        == "PRE-STRICT"
-
-        and
-
-        symbol_state.get(
-            "pre_strict_price"
-        )
-        is None
-    ):
-
-        symbol_state[
-            "pre_strict_price"
-        ] = current_price
-
-        symbol_state[
-            "pre_strict_time"
-        ] = now_iso()
-
-
-    # ========================================================
-    # STRICT
-    # ========================================================
-
-    if (
-
-        status == "STRICT"
-
-        and
-
-        symbol_state.get(
-            "strict_price"
-        )
-        is None
-    ):
-
-        symbol_state[
-            "strict_price"
-        ] = current_price
-
-        symbol_state[
-            "strict_time"
-        ] = now_iso()
-
-
-# ============================================================
-# 階段統計
-# ============================================================
-
-def stage_stats(
-    symbol_state
-):
-
-    current = symbol_state.get(
-        "current_price"
+    # 上沿：近期壓力 + 趨勢延伸空間
+    resistance_30d = recent_high(r4, 180)
+    atr_upper = (atr_pct or 0.0) * 3.0
+    upper_distance = clamp(
+        max(min_upper, atr_upper),
+        min_upper,
+        MAX_UPPER_DISTANCE_PCT,
     )
+    pct_ceiling = current_price * (1.0 + upper_distance / 100.0)
 
-    watch = symbol_state.get(
-        "watch_price"
+    if resistance_30d is not None:
+        upper = max(pct_ceiling, resistance_30d * 1.01)
+    else:
+        upper = pct_ceiling
+
+    absolute_upper_cap = current_price * (1.0 + MAX_UPPER_DISTANCE_PCT / 100.0)
+    upper = min(upper, absolute_upper_cap)
+    actual_upper_pct = pct_change(current_price, upper)
+
+    # 等比格數，以目標單格毛幅估算
+    if lower > 0 and upper > lower:
+        raw_grids = round(
+            math.log(upper / lower)
+            / math.log(1.0 + per_grid_target / 100.0)
+        )
+    else:
+        raw_grids = 24
+
+    grids = int(clamp(raw_grids, 18, 40))
+    geometric_grid_pct = ((upper / lower) ** (1.0 / grids) - 1.0) * 100.0
+
+    # 強平不是只靠K線能精確推算，所以給「平台實際強平價必須低於」的硬要求
+    required_liq_below = lower * (1.0 - LIQ_BUFFER_BELOW_LOWER_PCT / 100.0)
+
+    # 20%級快速回撤能不能仍在區間內
+    flash20_price = current_price * 0.80
+    flash20_inside = lower <= flash20_price
+
+    survival_pass = (
+        actual_lower_pct >= min_lower
+        and actual_lower_pct >= 10.0
     )
-
-    trend = symbol_state.get(
-        "trend_ready_price"
-    )
-
-    pre = symbol_state.get(
-        "pre_strict_price"
-    )
-
-    strict = symbol_state.get(
-        "strict_price"
-    )
-
 
     return {
-
-        "current":
-            current,
-
-        "watch":
-            watch,
-
-        "trend":
-            trend,
-
-        "pre":
-            pre,
-
-        "strict":
-            strict,
-
-
-        "watch_to_now":
-            pct_change(
-                watch,
-                current
-            ),
-
-        "trend_to_now":
-            pct_change(
-                trend,
-                current
-            ),
-
-        "pre_to_now":
-            pct_change(
-                pre,
-                current
-            ),
-
-        "strict_to_now":
-            pct_change(
-                strict,
-                current
-            ),
-
-
-        "watch_to_trend":
-            pct_change(
-                watch,
-                trend
-            ),
-
-        "trend_to_pre":
-            pct_change(
-                trend,
-                pre
-            ),
-
-        "pre_to_strict":
-            pct_change(
-                pre,
-                strict
-            ),
-
-        "watch_to_strict":
-            pct_change(
-                watch,
-                strict
-            ),
+        "direction": "LONG_GRID",
+        "entry_price": current_price,
+        "lower": lower,
+        "upper": upper,
+        "lower_distance_pct": pct_change(current_price, lower),
+        "upper_distance_pct": actual_upper_pct,
+        "grid_count": grids,
+        "grid_mode": "GEOMETRIC",
+        "estimated_gross_per_grid_pct": geometric_grid_pct,
+        "suggested_leverage": leverage,
+        "capital_pct": capital_pct,
+        "atr14": atr14,
+        "atr_pct": atr_pct,
+        "vol_profile": profile,
+        "support_30d": support_30d,
+        "support_60d": support_60d,
+        "resistance_30d": resistance_30d,
+        "flash20_inside_grid": flash20_inside,
+        "required_liquidation_below": required_liq_below,
+        "liquidation_rule": (
+            f"平台實際強平價需 <= {price_text(required_liq_below)} "
+            f"(至少低於下沿 {LIQ_BUFFER_BELOW_LOWER_PCT:.0f}%)"
+        ),
+        "survival_pass": survival_pass,
     }
 
 
 # ============================================================
-# 階段顯示
+# Analysis
 # ============================================================
 
-def build_stage_block(
-    symbol_state
-):
+def analyze(base_symbol, contract):
+    now = int(datetime.now(timezone.utc).timestamp())
 
-    s = stage_stats(
-        symbol_state
+    r4 = completed_only(
+        fetch(contract, "4h", LIMIT_4H),
+        FOUR_H,
+        now,
+    )
+    rd = completed_only(
+        fetch(contract, "1d", LIMIT_1D),
+        ONE_D,
+        now,
     )
 
-    lines = []
-
-
-    if (
-        s["watch"]
-        is not None
-    ):
-
-        lines.append(
-            "WATCH："
-            +
-            price_text(
-                s["watch"]
-            )
+    if len(r4) < 65 or len(rd) < 65:
+        raise RuntimeError(
+            f"insufficient candles: 4h={len(r4)} 1d={len(rd)}"
         )
 
+    add_ind(r4, FOUR_H)
+    add_ind(rd, ONE_D)
 
-    if (
-        s["trend"]
-        is not None
-    ):
-
-        lines.append(
-            "TREND_READY："
-            +
-            price_text(
-                s["trend"]
-            )
-        )
-
-
-    if (
-        s["pre"]
-        is not None
-    ):
-
-        lines.append(
-            "PRE-STRICT："
-            +
-            price_text(
-                s["pre"]
-            )
-        )
-
-
-    if (
-        s["strict"]
-        is not None
-    ):
-
-        lines.append(
-            "STRICT："
-            +
-            price_text(
-                s["strict"]
-            )
-        )
-
-
-    lines.append(
-        "目前："
-        +
-        price_text(
-            s["current"]
-        )
+    latest = r4[-1]
+    raw_now, d = strict_raw_at(latest, rd)
+    kept = kept_strict(r4, rd)
+    strict_now = bool(
+        kept
+        and kept[-1]["t"] == latest["t"]
     )
 
-
-    movement = []
-
-
-    if (
-        s["watch_to_now"]
-        is not None
-    ):
-
-        movement.append(
-            "WATCH→目前："
-            +
-            pct_text(
-                s["watch_to_now"]
-            )
-        )
-
-
-    if (
-        s["trend_to_now"]
-        is not None
-    ):
-
-        movement.append(
-            "TREND_READY→目前："
-            +
-            pct_text(
-                s["trend_to_now"]
-            )
-        )
-
-
-    if (
-        s["pre_to_now"]
-        is not None
-    ):
-
-        movement.append(
-            "PRE-STRICT→目前："
-            +
-            pct_text(
-                s["pre_to_now"]
-            )
-        )
-
-
-    if (
-        s["strict_to_now"]
-        is not None
-    ):
-
-        movement.append(
-            "STRICT→目前："
-            +
-            pct_text(
-                s["strict_to_now"]
-            )
-        )
-
-
-    if movement:
-
-        lines.append("")
-
-        lines.extend(
-            movement
-        )
-
-
-    transitions = []
-
-
-    if (
-        s["watch_to_trend"]
-        is not None
-    ):
-
-        transitions.append(
-            "WATCH→TREND_READY："
-            +
-            pct_text(
-                s["watch_to_trend"]
-            )
-        )
-
-
-    if (
-        s["trend_to_pre"]
-        is not None
-    ):
-
-        transitions.append(
-            "TREND_READY→PRE-STRICT："
-            +
-            pct_text(
-                s["trend_to_pre"]
-            )
-        )
-
-
-    if (
-        s["pre_to_strict"]
-        is not None
-    ):
-
-        transitions.append(
-            "PRE-STRICT→STRICT："
-            +
-            pct_text(
-                s["pre_to_strict"]
-            )
-        )
-
-
-    if transitions:
-
-        lines.append("")
-
-        lines.extend(
-            transitions
-        )
-
-
-    return "\n".join(
-        lines
+    status = classify_status(
+        latest,
+        d,
+        strict_now,
     )
+
+    grid = None
+    if status == "PRE-STRICT":
+        grid = longlife_grid_plan(
+            r4,
+            latest["c"],
+            PRE_STRICT_GRID_A_PCT,
+        )
+    elif status == "STRICT":
+        grid = longlife_grid_plan(
+            r4,
+            latest["c"],
+            STRICT_GRID_B_PCT,
+        )
+
+    return {
+        "base": base_symbol,
+        "contract": contract,
+        "group": (
+            "VALIDATED"
+            if base_symbol in VALIDATED
+            else "EXTENDED"
+        ),
+        "status": status,
+        "latest_4h_open_utc": iso(latest["t"]),
+        "latest_4h_close_utc": iso(latest["close_t"]),
+        "latest_close": latest["c"],
+        "4h_structure": structure_4h_ok(latest),
+        "4h_relaxed_volume": relaxed_volume_ok(latest),
+        "4h_core": core_ok(latest),
+        "1d_soft": daily_soft_ok(d),
+        "1d_confirm": daily_ok(d),
+        "strict_raw": raw_now,
+        "strict": strict_now,
+        "grid": grid,
+    }
 
 
 # ============================================================
-# 壓力顯示
+# Notifications
 # ============================================================
 
-def build_resistance_block(r):
+def send_ntfy(title, msg, priority="default", tags="bar_chart"):
+    if not NTFY_TOPIC:
+        print("NTFY_TOPIC not set; notification skipped.")
+        return False
 
-    r4_price = r.get(
-        "resistance_4h"
+    req = urllib.request.Request(
+        f"{NTFY_SERVER}/{NTFY_TOPIC}",
+        data=msg.encode("utf-8"),
+        method="POST",
+        headers={
+            "Title": title,
+            "Priority": priority,
+            "Tags": tags,
+            "Content-Type": "text/plain; charset=utf-8",
+        },
     )
 
-    r4_pct = r.get(
-        "resistance_4h_pct"
+    with urllib.request.urlopen(req, timeout=20) as resp:
+        print("ntfy:", resp.status, title)
+        return 200 <= resp.status < 300
+
+
+def format_grid(plan):
+    if not plan:
+        return "網格：N/A"
+
+    flash = (
+        "可留在網內"
+        if plan.get("flash20_inside_grid")
+        else "可能跌破下沿"
     )
 
-    r1d_price = r.get(
-        "resistance_1d"
+    survival = (
+        "PASS"
+        if plan.get("survival_pass")
+        else "CHECK"
     )
-
-    r1d_pct = r.get(
-        "resistance_1d_pct"
-    )
-
-
-    if r4_price is None:
-
-        r4_line = (
-            "最近4H Swing壓力："
-            "未找到"
-        )
-
-    else:
-
-        r4_line = (
-            "最近4H Swing壓力："
-            f"{price_text(r4_price)} "
-            f"({pct_text(r4_pct)})"
-        )
-
-
-    if r1d_price is None:
-
-        d1_line = (
-            "最近1D Swing壓力："
-            "未找到"
-        )
-
-    else:
-
-        d1_line = (
-            "最近1D Swing壓力："
-            f"{price_text(r1d_price)} "
-            f"({pct_text(r1d_pct)})"
-        )
-
 
     return (
-        f"{r4_line}\n"
-        f"{d1_line}"
+        f"方向：多網格\n"
+        f"建議進場參考：{price_text(plan.get('entry_price'))}\n"
+        f"下沿：{price_text(plan.get('lower'))} "
+        f"({pct_text(plan.get('lower_distance_pct'))})\n"
+        f"上沿：{price_text(plan.get('upper'))} "
+        f"({pct_text(plan.get('upper_distance_pct'))})\n"
+        f"格數：{plan.get('grid_count')}\n"
+        f"模式：等比\n"
+        f"預估單格毛幅：約 {plan.get('estimated_gross_per_grid_pct', 0):.2f}%\n"
+        f"建議槓桿：{plan.get('suggested_leverage')}x\n"
+        f"建議投入：總預算 {plan.get('capital_pct')}%\n"
+        f"4H ATR：{pct_text(plan.get('atr_pct'))}\n"
+        f"波動級別：{plan.get('vol_profile')}\n"
+        f"20%快速回撤：{flash}\n"
+        f"強平安全要求：{plan.get('liquidation_rule')}\n"
+        f"生存檢查：{survival}"
     )
+
+
+def notify_pre_strict(r):
+    g = r.get("grid")
+    msg = (
+        f"{r['base']} 2560 PRE-STRICT\n\n"
+        f"定位：第一段可開網候選\n"
+        f"現價：{price_text(r.get('latest_close'))}\n"
+        f"4H結構：{r.get('4h_structure')}\n"
+        f"4H放寬量能：{r.get('4h_relaxed_volume')}\n"
+        f"1D soft：{r.get('1d_soft')}\n\n"
+        f"【長壽網格 A】\n"
+        f"{format_grid(g)}\n\n"
+        f"原則：寧可寬一點、少成交幾格，也不要下沿太貼現價。"
+    )
+    send_ntfy(
+        f"2560 PRE-STRICT {r['base']}",
+        msg,
+        "high",
+        "chart_with_upwards_trend,bell",
+    )
+
+
+def notify_strict(r, symbol_state):
+    g = r.get("grid")
+    pre_price = symbol_state.get("pre_strict_entry_price")
+    rise = pct_change(pre_price, r.get("latest_close"))
+
+    if pre_price is None:
+        add_decision = "沒有記錄到前一個 PRE-STRICT；第二網需人工重新評估。"
+    elif rise is not None and rise <= STRICT_ADD_MAX_RISE_PCT:
+        add_decision = (
+            f"相對 PRE-STRICT 價格 {pct_text(rise)}，"
+            f"未超過 +{STRICT_ADD_MAX_RISE_PCT:.1f}%；"
+            f"可評估另開第二網 B。"
+        )
+    else:
+        add_decision = (
+            f"相對 PRE-STRICT 已上漲 {pct_text(rise)}；"
+            f"不追高，不開第二網 B。原網 A 繼續運行。"
+        )
+
+    msg = (
+        f"{r['base']} 2560 STRICT\n\n"
+        f"定位：趨勢確認 / 第二網審核點\n"
+        f"現價：{price_text(r.get('latest_close'))}\n"
+        f"PRE-STRICT價：{price_text(pre_price)}\n"
+        f"漲幅：{pct_text(rise)}\n\n"
+        f"第二網判斷：{add_decision}\n\n"
+        f"【若允許開網 B，重新依當下行情計算】\n"
+        f"{format_grid(g)}"
+    )
+    send_ntfy(
+        f"2560 STRICT {r['base']}",
+        msg,
+        "high",
+        "chart_with_upwards_trend,bell",
+    )
+
+
+def notify_status_change(r, state):
+    symbols = state.setdefault("symbols", {})
+    st = symbols.setdefault(r["base"], {})
+    old_status = st.get("status")
+    new_status = r["status"]
+
+    # PRE-STRICT 第一次進入時，鎖第一網參考價
+    if new_status == "PRE-STRICT" and old_status != "PRE-STRICT":
+        st["pre_strict_entry_price"] = r.get("latest_close")
+        st["pre_strict_time_utc"] = now_iso()
+        st["pre_strict_grid"] = r.get("grid")
+        notify_pre_strict(r)
+
+    # STRICT 狀態變化時才通知，避免洗版
+    if new_status == "STRICT" and old_status != "STRICT":
+        notify_strict(r, st)
+
+    st["status"] = new_status
+    st["last_price"] = r.get("latest_close")
+    st["updated_utc"] = now_iso()
 
 
 # ============================================================
-# 通知
-# ============================================================
-
-def notify_signal(
-    r,
-    state
-):
-
-    base = r["base"]
-
-    status = r["status"]
-
-
-    symbol_state = (
-        state
-        .setdefault(
-            "symbols",
-            {}
-        )
-        .setdefault(
-            base,
-            {}
-        )
-    )
-
-
-    previous = (
-        symbol_state.get(
-            "status",
-            "UNKNOWN"
-        )
-    )
-
-
-    print(
-        f"{base}: "
-        f"{previous} -> "
-        f"{status}"
-    )
-
-
-    update_stage_memory(
-        r,
-        symbol_state,
-        previous
-    )
-
-
-    # 同狀態不重複通知
-    if (
-        status
-        == previous
-    ):
-
-        symbol_state[
-            "updated_utc"
-        ] = now_iso()
-
-        return
-
-
-    ratio = r.get(
-        "4h_volume_ratio"
-    )
-
-
-    ratio_text = (
-        f"{ratio:.2f}"
-        if ratio
-        is not None
-        else "N/A"
-    )
-
-
-    stage_block = (
-        build_stage_block(
-            symbol_state
-        )
-    )
-
-
-    resistance_block = (
-        build_resistance_block(
-            r
-        )
-    )
-
-
-    # ========================================================
-    # STRICT
-    # ========================================================
-
-    if status == "STRICT":
-
-        stats = stage_stats(
-            symbol_state
-        )
-
-
-        chase = stats.get(
-            "pre_to_strict"
-        )
-
-
-        send_ntfy(
-            f"2560 STRICT {base}",
-
-            (
-                f"{base} 正式 2560 STRICT\n"
-                f"Gate：{r['contract']}\n\n"
-
-                f"{stage_block}\n\n"
-
-                f"{resistance_block}\n\n"
-
-                f"PRE→STRICT追價幅度："
-                f"{pct_text(chase)}\n\n"
-
-                f"4H close："
-                f"{price_text(r['latest_4h_close'])}\n"
-
-                f"4H CORE=True\n"
-                f"1D=True\n"
-
-                f"Vol5/Vol60="
-                f"{ratio_text}\n\n"
-
-                f"進入長壽多網格人工複核。"
-            ),
-
-            "high",
-
-            "chart_with_upwards_trend,bell"
-        )
-
-
-    # ========================================================
-    # PRE STRICT
-    # ========================================================
-
-    elif status == "PRE-STRICT":
-
-        send_ntfy(
-            f"2560 PRE-STRICT {base}",
-
-            (
-                f"{base} 進入 PRE-STRICT\n\n"
-
-                f"{stage_block}\n\n"
-
-                f"{resistance_block}\n\n"
-
-                f"1H=True\n"
-                f"4H structure=True\n"
-                f"4H relaxed volume=True\n"
-                f"1D=True\n"
-
-                f"4H Core 尚未完成\n"
-
-                f"Vol5/Vol60="
-                f"{ratio_text}\n\n"
-
-                f"趨勢與量能已成熟，"
-                f"等待原版 Strict。"
-            ),
-
-            "high",
-
-            "eyes,chart_with_upwards_trend"
-        )
-
-
-    # ========================================================
-    # TREND READY
-    # ========================================================
-
-    elif status == "TREND_READY":
-
-        send_ntfy(
-            f"2560 TREND READY {base}",
-
-            (
-                f"{base} 進入 TREND_READY\n\n"
-
-                f"{stage_block}\n\n"
-
-                f"{resistance_block}\n\n"
-
-                f"1H=True\n"
-                f"4H early=True\n"
-                f"4H relaxed volume=True\n"
-                f"1D soft=True\n"
-
-                f"Vol5/Vol60="
-                f"{ratio_text}\n\n"
-
-                f"尚不是 Strict，"
-                f"開始人工注意。"
-            ),
-
-            "default",
-
-            "eyes,chart_with_upwards_trend"
-        )
-
-
-    # ========================================================
-    # WATCH
-    # ========================================================
-
-    elif status == "WATCH":
-
-        send_ntfy(
-            f"2560 WATCH {base}",
-
-            (
-                f"{base} 進入 WATCH\n\n"
-
-                f"{stage_block}\n\n"
-
-                f"{resistance_block}\n\n"
-
-                f"1H 多頭已成立\n"
-
-                f"4H / 量能 / 1D "
-                f"尚未完全成熟。\n\n"
-
-                f"先觀察。"
-            ),
-
-            "default",
-
-            "eyes"
-        )
-
-
-    # ========================================================
-    # NO SIGNAL
-    # ========================================================
-
-    elif status == "NO_SIGNAL":
-
-        if previous in (
-            "WATCH",
-            "TREND_READY",
-            "PRE-STRICT",
-            "STRICT"
-        ):
-
-            send_ntfy(
-                f"2560 signal invalid {base}",
-
-                (
-                    f"{base} 2560 候選環境失效\n\n"
-
-                    f"{stage_block}\n\n"
-
-                    f"{resistance_block}\n\n"
-
-                    f"前一狀態："
-                    f"{previous}\n\n"
-
-                    f"本輪歷史保留，"
-                    f"新週期再重置。"
-                ),
-
-                "default",
-
-                "warning"
-            )
-
-
-    symbol_state[
-        "status"
-    ] = status
-
-
-    symbol_state[
-        "updated_utc"
-    ] = now_iso()
-
-
-# ============================================================
-# MAIN
+# Main
 # ============================================================
 
 def main():
-
+    print("2560 Cloud Monitor | PRE-STRICT Long-Life Grid v3.0")
+    print("UTC:", now_iso())
     print(
-        "2560 Cloud Monitor | v4.5"
+        "Rule: NO_SIGNAL -> WATCH -> TREND_READY -> "
+        "PRE-STRICT -> STRICT"
     )
-
     print(
-        now_iso()
+        "PRE-STRICT = first long-life grid candidate | "
+        "STRICT = confirmation / second-grid review"
     )
-
 
     state = load_state()
+    contract_map = discover_contracts()
 
-    contracts = (
-        discover_contracts()
-    )
-
-
-    print(
-        "\nCONTRACT MAP"
-    )
-
-
+    print("\nCONTRACT MAP")
     for base in REQUESTED:
-
-        print(
-            f"{base:<5} -> "
-            f"{contracts.get(base)}"
-        )
-
+        print(f"{base:<5} -> {contract_map.get(base)}")
 
     results = []
-
     errors = []
 
-
-    print(
-        "\nSCAN"
-    )
-
-
+    print("\nSCAN")
     for base in REQUESTED:
-
-        contract = (
-            contracts.get(
-                base
-            )
-        )
-
+        contract = contract_map.get(base)
 
         if not contract:
-
-            print(
-                f"{base:<5} "
-                f"NOT_FOUND"
-            )
-
+            print(f"{base:<5} NOT_FOUND")
+            results.append({
+                "base": base,
+                "status": "NOT_FOUND",
+            })
             continue
 
-
         try:
+            r = analyze(base, contract)
+            results.append(r)
 
-            r = analyze(
-                base,
-                contract
-            )
-
-
-            results.append(
-                r
-            )
-
-
-            if (
-                r["status"]
-                ==
-                "WAIT_HISTORY"
-            ):
-
-                print(
-                    f"{base:<5} "
-                    f"WAIT_HISTORY "
-                    f"1H={r['bars_1h']} "
-                    f"4H={r['bars_4h']} "
-                    f"1D={r['bars_1d']}"
+            g = r.get("grid") or {}
+            grid_text = ""
+            if r["status"] in ("PRE-STRICT", "STRICT"):
+                grid_text = (
+                    f" grid={price_text(g.get('lower'))}"
+                    f"~{price_text(g.get('upper'))}"
+                    f" n={g.get('grid_count')}"
+                    f" lev={g.get('suggested_leverage')}x"
+                    f" survive={g.get('survival_pass')}"
                 )
-
-                continue
-
-
-            ratio = r.get(
-                "4h_volume_ratio"
-            )
-
-
-            ratio_text = (
-                f"{ratio:.2f}"
-                if ratio
-                is not None
-                else "N/A"
-            )
-
 
             print(
                 f"{base:<5} "
                 f"{r['status']:<12} "
-
-                f"contract="
-                f"{contract:<18} "
-
-                f"last="
-                f"{price_text(r['current_price'])} "
-
-                f"4Hclose="
-                f"{price_text(r['latest_4h_close'])} "
-
-                f"1H="
-                f"{r['1h_confirm']} "
-
-                f"4Hearly="
-                f"{r['4h_early']} "
-
-                f"4Hstruct="
-                f"{r['4h_structure']} "
-
-                f"VolRelax="
-                f"{r['4h_volume_relaxed']} "
-
-                f"V5/V60="
-                f"{ratio_text} "
-
-                f"4Hcore="
-                f"{r['4h_core']} "
-
-                f"1Dsoft="
-                f"{r['1d_soft']} "
-
-                f"1D="
-                f"{r['1d_confirm']} "
-
-                f"Swing4H="
-                f"{price_text(r['resistance_4h'])} "
-
-                f"R4Hdist="
-                f"{pct_text(r['resistance_4h_pct'])} "
-
-                f"Swing1D="
-                f"{price_text(r['resistance_1d'])} "
-
-                f"R1Ddist="
-                f"{pct_text(r['resistance_1d_pct'])}"
+                f"close={price_text(r['latest_close'])} "
+                f"4Hstruct={r['4h_structure']} "
+                f"relVol={r['4h_relaxed_volume']} "
+                f"4Hcore={r['4h_core']} "
+                f"1Dsoft={r['1d_soft']} "
+                f"1D={r['1d_confirm']}"
+                f"{grid_text}"
             )
 
-
-            notify_signal(
-                r,
-                state
-            )
-
+            notify_status_change(r, state)
 
         except Exception as e:
+            errors.append((base, str(e)))
+            print(f"{base:<5} ERROR {e}")
+            results.append({
+                "base": base,
+                "contract": contract,
+                "status": "ERROR",
+                "error": str(e),
+            })
 
-            errors.append(
-                (
-                    base,
-                    str(e)
-                )
-            )
+        time.sleep(0.15)
 
-
-            print(
-                f"{base:<5} "
-                f"ERROR {e}"
-            )
-
-
-        time.sleep(
-            0.12
-        )
-
-
-    save_state(
-        state
+    RESULT_FILE.write_text(
+        json.dumps(
+            {
+                "generated_utc": now_iso(),
+                "rule_version": "2560_PRESTRICT_LONG_LIFE_GRID_V3",
+                "results": results,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
     )
 
+    save_state(state)
 
-    counts = {}
-
-
-    for r in results:
-
-        status = r.get(
-            "status",
-            "UNKNOWN"
-        )
-
-
-        counts[status] = (
-            counts.get(
-                status,
-                0
-            )
-            + 1
-        )
-
-
-    print(
-        "\nSTATUS COUNTS:",
-        counts
-    )
-
-    print(
-        "ERROR COUNT:",
-        len(errors)
-    )
-
-    print(
-        "STATE FILE:",
-        STATE_FILE
-    )
+    counts = Counter(r.get("status") for r in results)
+    print("\nSTATUS COUNTS:", dict(counts))
+    print("SYMBOL COUNT:", len(results))
+    print("ERROR COUNT:", len(errors))
+    print("STATE FILE:", STATE_FILE)
+    print("RESULT FILE:", RESULT_FILE)
 
 
 if __name__ == "__main__":
