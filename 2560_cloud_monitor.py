@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 
 """
-2560 Cloud Monitor v4.3
+2560 Cloud Monitor v4.4
 =======================
 
 狀態：
@@ -12,7 +12,7 @@ TREND_READY
 PRE-STRICT
 STRICT
 
-STRICT 原版規則完全保持不變：
+原版 STRICT 規則保持不變：
 
 4H CORE
 - MA25 rising
@@ -26,19 +26,17 @@ STRICT 原版規則完全保持不變：
 
 20-bar dedup
 
-v4.3 新增：
-- WATCH 第一次出現價格 / 時間
-- TREND_READY 第一次出現價格 / 時間
-- PRE-STRICT 第一次出現價格 / 時間
-- STRICT 第一次出現價格 / 時間
-- 最新 5m 完成K價格
+v4.4 功能：
+- WATCH / TREND_READY / PRE-STRICT / STRICT 階段價格記憶
+- 各階段首次出現時間
+- 5m 完成K作為接近現價
 - 各階段 -> 目前 漲跌幅
-- WATCH -> TREND_READY
-- TREND_READY -> PRE-STRICT
-- PRE-STRICT -> STRICT
+- 各階段之間漲幅
 - PRE-STRICT -> STRICT 追價幅度
-- NO_SIGNAL 失效通知保留完整階段歷史
-- 新週期開始才清除上一輪價格紀錄
+- 最近4H壓力價 / 距離
+- 最近1D壓力價 / 距離
+- NO_SIGNAL 時保留本輪歷史
+- 新週期開始時重置
 
 Public Gate data only.
 No API key.
@@ -54,6 +52,7 @@ import urllib.request
 
 from datetime import datetime, timezone
 from pathlib import Path
+from email.header import Header
 
 
 # ============================================================
@@ -97,7 +96,7 @@ ONE_H = 60 * 60
 FOUR_H = 4 * 60 * 60
 ONE_D = 24 * 60 * 60
 
-LIMIT_5M = 10
+LIMIT_5M = 20
 LIMIT_1H = 220
 LIMIT_4H = 220
 LIMIT_1D = 120
@@ -139,6 +138,14 @@ def now_iso():
     ).isoformat()
 
 
+def iso(ts):
+
+    return datetime.fromtimestamp(
+        ts,
+        timezone.utc
+    ).isoformat()
+
+
 def norm(s):
 
     return re.sub(
@@ -146,14 +153,6 @@ def norm(s):
         "",
         str(s).upper()
     )
-
-
-def iso(ts):
-
-    return datetime.fromtimestamp(
-        ts,
-        timezone.utc
-    ).isoformat()
 
 
 def price_text(v):
@@ -231,7 +230,7 @@ def gate_get(
                 url,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "2560-cloud-monitor/4.3",
+                    "User-Agent": "2560-cloud-monitor/4.4",
                 }
             )
 
@@ -279,8 +278,6 @@ def discover_contracts():
         for name in names
     }
 
-    mapping = {}
-
     aliases = {
 
         "BRKB": [
@@ -295,6 +292,7 @@ def discover_contracts():
         ],
     }
 
+    mapping = {}
 
     for base in REQUESTED:
 
@@ -519,7 +517,6 @@ def one_hour_confirm(r):
         r.get("ma5"),
         r.get("ma10"),
         r.get("ma20"),
-        r.get("ma25"),
     ]
 
     if any(
@@ -751,7 +748,7 @@ def last_completed_daily_asof(
 
 
 # ============================================================
-# Strict history
+# STRICT history
 # ============================================================
 
 def strict_raw_at(
@@ -787,11 +784,9 @@ def kept_strict(
 
             raw.append(r)
 
-
     kept = []
 
     last_i = -10**9
-
 
     for r in raw:
 
@@ -806,6 +801,65 @@ def kept_strict(
             last_i = r["i"]
 
     return kept
+
+
+# ============================================================
+# 壓力位
+# ============================================================
+
+def find_recent_resistance(
+    rows,
+    current_price,
+    lookback
+):
+
+    if (
+        current_price is None
+        or current_price <= 0
+    ):
+        return None
+
+    candidates = []
+
+    for r in rows[-lookback:]:
+
+        high = r.get("h")
+
+        if (
+            high is not None
+            and
+            high > current_price
+        ):
+
+            candidates.append(
+                high
+            )
+
+    if not candidates:
+        return None
+
+    return min(
+        candidates
+    )
+
+
+def resistance_distance(
+    current_price,
+    resistance
+):
+
+    if (
+        current_price is None
+        or resistance is None
+        or current_price <= 0
+    ):
+        return None
+
+    return (
+        resistance
+        / current_price
+        - 1
+    ) * 100
 
 
 # ============================================================
@@ -825,8 +879,8 @@ def analyze(
 
 
     # --------------------------------------------------------
-    # 5m 只拿來記錄接近現價
-    # 不參與 2560 訊號
+    # 5m：只作為接近現價
+    # 完全不參與2560訊號
     # --------------------------------------------------------
 
     r5 = completed_only(
@@ -884,6 +938,7 @@ def analyze(
     ):
 
         return {
+
             "base":
                 base,
 
@@ -931,15 +986,22 @@ def analyze(
     latest5 = r5[-1]
 
     latest1 = r1[-1]
+
     previous1 = r1[-2]
 
     latest4 = r4[-1]
+
 
     latest_d = (
         last_completed_daily_asof(
             rd,
             latest4["close_t"]
         )
+    )
+
+
+    current_price = (
+        latest5["c"]
     )
 
 
@@ -1153,6 +1215,42 @@ def analyze(
         )
 
 
+    # ========================================================
+    # 4H / 1D 壓力
+    # ========================================================
+
+    resistance_4h = (
+        find_recent_resistance(
+            r4,
+            current_price,
+            48
+        )
+    )
+
+    resistance_1d = (
+        find_recent_resistance(
+            rd,
+            current_price,
+            60
+        )
+    )
+
+
+    resistance_4h_pct = (
+        resistance_distance(
+            current_price,
+            resistance_4h
+        )
+    )
+
+    resistance_1d_pct = (
+        resistance_distance(
+            current_price,
+            resistance_1d
+        )
+    )
+
+
     return {
 
         "base":
@@ -1170,12 +1268,11 @@ def analyze(
             status,
 
 
-        # 5m 完成K，作為接近現價
+        # 5m 完成K作為接近現價
         "current_price":
-            latest5["c"],
+            current_price,
 
 
-        # 保留原本 4H close
         "latest_4h_close":
             latest4["c"],
 
@@ -1212,6 +1309,21 @@ def analyze(
 
         "strict":
             strict_now,
+
+
+        # 壓力資訊
+        "resistance_4h":
+            resistance_4h,
+
+        "resistance_4h_pct":
+            resistance_4h_pct,
+
+        "resistance_1d":
+            resistance_1d,
+
+        "resistance_1d_pct":
+            resistance_1d_pct,
+
 
         "latest_5m_open_utc":
             iso(
@@ -1250,6 +1362,15 @@ def send_ntfy(
         return False
 
 
+    # 中文標題安全處理
+    safe_title = str(
+        Header(
+            title,
+            "utf-8"
+        )
+    )
+
+
     req = urllib.request.Request(
         f"{NTFY_SERVER}/{NTFY_TOPIC}",
         data=msg.encode(
@@ -1258,7 +1379,7 @@ def send_ntfy(
         method="POST",
         headers={
             "Title":
-                title,
+                safe_title,
 
             "Priority":
                 priority,
@@ -1421,7 +1542,6 @@ def update_stage_memory(
     ]
 
 
-    # 每次更新接近現價
     symbol_state[
         "current_price"
     ] = current_price
@@ -1439,9 +1559,9 @@ def update_stage_memory(
     )
 
 
-    # --------------------------------------------------------
-    # 新週期
-    # --------------------------------------------------------
+    # ========================================================
+    # 新週期開始
+    # ========================================================
 
     if (
         previous
@@ -1452,8 +1572,7 @@ def update_stage_memory(
 
         and
 
-        status
-        in active_states
+        status in active_states
     ):
 
         reset_cycle(
@@ -1469,9 +1588,9 @@ def update_stage_memory(
         ] = now_iso()
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # WATCH
-    # --------------------------------------------------------
+    # ========================================================
 
     if (
         status == "WATCH"
@@ -1493,9 +1612,9 @@ def update_stage_memory(
         ] = now_iso()
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # TREND_READY
-    # --------------------------------------------------------
+    # ========================================================
 
     if (
         status == "TREND_READY"
@@ -1517,9 +1636,9 @@ def update_stage_memory(
         ] = now_iso()
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # PRE-STRICT
-    # --------------------------------------------------------
+    # ========================================================
 
     if (
         status == "PRE-STRICT"
@@ -1541,9 +1660,9 @@ def update_stage_memory(
         ] = now_iso()
 
 
-    # --------------------------------------------------------
+    # ========================================================
     # STRICT
-    # --------------------------------------------------------
+    # ========================================================
 
     if (
         status == "STRICT"
@@ -1612,7 +1731,6 @@ def stage_stats(
             strict,
 
 
-        # 各階段 -> 現在
         "watch_to_now":
             pct_change(
                 watch,
@@ -1638,7 +1756,6 @@ def stage_stats(
             ),
 
 
-        # 階段之間
         "watch_to_trend":
             pct_change(
                 watch,
@@ -1679,10 +1796,6 @@ def build_stage_block(
 
     lines = []
 
-
-    # --------------------------------------------------------
-    # 階段價格
-    # --------------------------------------------------------
 
     if s["watch"] is not None:
 
@@ -1732,16 +1845,12 @@ def build_stage_block(
     )
 
 
-    # --------------------------------------------------------
-    # 各階段到目前
-    # --------------------------------------------------------
-
-    movement_lines = []
+    movement = []
 
 
     if s["watch_to_now"] is not None:
 
-        movement_lines.append(
+        movement.append(
             "WATCH→目前："
             + pct_text(
                 s["watch_to_now"]
@@ -1751,7 +1860,7 @@ def build_stage_block(
 
     if s["trend_to_now"] is not None:
 
-        movement_lines.append(
+        movement.append(
             "TREND_READY→目前："
             + pct_text(
                 s["trend_to_now"]
@@ -1761,7 +1870,7 @@ def build_stage_block(
 
     if s["pre_to_now"] is not None:
 
-        movement_lines.append(
+        movement.append(
             "PRE-STRICT→目前："
             + pct_text(
                 s["pre_to_now"]
@@ -1771,7 +1880,7 @@ def build_stage_block(
 
     if s["strict_to_now"] is not None:
 
-        movement_lines.append(
+        movement.append(
             "STRICT→目前："
             + pct_text(
                 s["strict_to_now"]
@@ -1779,25 +1888,21 @@ def build_stage_block(
         )
 
 
-    if movement_lines:
+    if movement:
 
         lines.append("")
 
         lines.extend(
-            movement_lines
+            movement
         )
 
 
-    # --------------------------------------------------------
-    # 階段之間
-    # --------------------------------------------------------
-
-    transition_lines = []
+    transitions = []
 
 
     if s["watch_to_trend"] is not None:
 
-        transition_lines.append(
+        transitions.append(
             "WATCH→TREND_READY："
             + pct_text(
                 s["watch_to_trend"]
@@ -1807,7 +1912,7 @@ def build_stage_block(
 
     if s["trend_to_pre"] is not None:
 
-        transition_lines.append(
+        transitions.append(
             "TREND_READY→PRE-STRICT："
             + pct_text(
                 s["trend_to_pre"]
@@ -1817,7 +1922,7 @@ def build_stage_block(
 
     if s["pre_to_strict"] is not None:
 
-        transition_lines.append(
+        transitions.append(
             "PRE-STRICT→STRICT："
             + pct_text(
                 s["pre_to_strict"]
@@ -1825,17 +1930,78 @@ def build_stage_block(
         )
 
 
-    if transition_lines:
+    if transitions:
 
         lines.append("")
 
         lines.extend(
-            transition_lines
+            transitions
         )
 
 
     return "\n".join(
         lines
+    )
+
+
+# ============================================================
+# 壓力位文字
+# ============================================================
+
+def build_resistance_block(r):
+
+    r4_price = r.get(
+        "resistance_4h"
+    )
+
+    r4_pct = r.get(
+        "resistance_4h_pct"
+    )
+
+    r1d_price = r.get(
+        "resistance_1d"
+    )
+
+    r1d_pct = r.get(
+        "resistance_1d_pct"
+    )
+
+
+    if r4_price is None:
+
+        r4_line = (
+            "最近4H壓力："
+            "目前區間內無明顯上方壓力"
+        )
+
+    else:
+
+        r4_line = (
+            "最近4H壓力："
+            f"{price_text(r4_price)} "
+            f"({pct_text(r4_pct)})"
+        )
+
+
+    if r1d_price is None:
+
+        d1_line = (
+            "最近1D壓力："
+            "目前區間內無明顯上方壓力"
+        )
+
+    else:
+
+        d1_line = (
+            "最近1D壓力："
+            f"{price_text(r1d_price)} "
+            f"({pct_text(r1d_pct)})"
+        )
+
+
+    return (
+        f"{r4_line}\n"
+        f"{d1_line}"
     )
 
 
@@ -1878,10 +2044,7 @@ def notify_signal(
     )
 
 
-    # --------------------------------------------------------
-    # 先更新階段價格
-    # --------------------------------------------------------
-
+    # 先更新價格記憶
     update_stage_memory(
         r,
         symbol_state,
@@ -1889,11 +2052,7 @@ def notify_signal(
     )
 
 
-    # --------------------------------------------------------
-    # 同狀態不重複發通知
-    # 但 current_price 已經更新
-    # --------------------------------------------------------
-
+    # 同狀態不重複通知
     if status == previous:
 
         symbol_state[
@@ -1914,8 +2073,17 @@ def notify_signal(
     )
 
 
-    stage_block = build_stage_block(
-        symbol_state
+    stage_block = (
+        build_stage_block(
+            symbol_state
+        )
+    )
+
+
+    resistance_block = (
+        build_resistance_block(
+            r
+        )
     )
 
 
@@ -1933,12 +2101,6 @@ def notify_signal(
             "pre_to_strict"
         )
 
-        chase_text = (
-            pct_text(chase)
-            if chase is not None
-            else "N/A"
-        )
-
 
         send_ntfy(
             f"2560 STRICT {base}",
@@ -1948,8 +2110,10 @@ def notify_signal(
 
                 f"{stage_block}\n\n"
 
+                f"{resistance_block}\n\n"
+
                 f"PRE→STRICT追價幅度："
-                f"{chase_text}\n\n"
+                f"{pct_text(chase)}\n\n"
 
                 f"4H close："
                 f"{price_text(r['latest_4h_close'])}\n"
@@ -1980,6 +2144,8 @@ def notify_signal(
 
                 f"{stage_block}\n\n"
 
+                f"{resistance_block}\n\n"
+
                 f"1H=True\n"
                 f"4H structure=True\n"
                 f"4H relaxed volume=True\n"
@@ -1991,7 +2157,7 @@ def notify_signal(
                 f"{ratio_text}\n\n"
 
                 f"趨勢與量能已成熟，"
-                f"等待原版 Strict 觸發。"
+                f"等待原版 Strict。"
             ),
             "high",
             "eyes,chart_with_upwards_trend"
@@ -2011,6 +2177,8 @@ def notify_signal(
 
                 f"{stage_block}\n\n"
 
+                f"{resistance_block}\n\n"
+
                 f"1H=True\n"
                 f"4H early=True\n"
                 f"4H relaxed volume=True\n"
@@ -2019,7 +2187,7 @@ def notify_signal(
                 f"Vol5/Vol60="
                 f"{ratio_text}\n\n"
 
-                f"尚不是 Strict。\n"
+                f"尚不是 Strict，"
                 f"開始人工注意。"
             ),
             "default",
@@ -2039,6 +2207,8 @@ def notify_signal(
                 f"{base} 進入 WATCH\n\n"
 
                 f"{stage_block}\n\n"
+
+                f"{resistance_block}\n\n"
 
                 f"1H 多頭已成立\n"
 
@@ -2072,20 +2242,18 @@ def notify_signal(
 
                     f"{stage_block}\n\n"
 
+                    f"{resistance_block}\n\n"
+
                     f"前一狀態："
                     f"{previous}\n\n"
 
-                    f"這一輪歷史先保留，"
-                    f"下一個新週期開始時重置。"
+                    f"本輪歷史保留，"
+                    f"新週期再重置。"
                 ),
                 "default",
                 "warning"
             )
 
-
-    # ========================================================
-    # 更新狀態
-    # ========================================================
 
     symbol_state[
         "status"
@@ -2103,7 +2271,7 @@ def notify_signal(
 def main():
 
     print(
-        "2560 Cloud Monitor | v4.3"
+        "2560 Cloud Monitor | v4.4"
     )
 
     print(
@@ -2229,7 +2397,19 @@ def main():
                 f"{r['1d_soft']} "
 
                 f"1D="
-                f"{r['1d_confirm']}"
+                f"{r['1d_confirm']} "
+
+                f"R4H="
+                f"{price_text(r['resistance_4h'])} "
+
+                f"R4Hdist="
+                f"{pct_text(r['resistance_4h_pct'])} "
+
+                f"R1D="
+                f"{price_text(r['resistance_1d'])} "
+
+                f"R1Ddist="
+                f"{pct_text(r['resistance_1d_pct'])}"
             )
 
 
@@ -2263,10 +2443,6 @@ def main():
         state
     )
 
-
-    # ========================================================
-    # Summary
-    # ========================================================
 
     counts = {}
 
