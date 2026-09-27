@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-2560 Cloud Monitor v3.1 — PRE-STRICT Long-Life Grid
+2560 Cloud Monitor v3.2 — PRE-STRICT Long-Life Grid
 ===================================================
 
 用途
@@ -31,7 +31,7 @@
    - 若先前已有 PRE-STRICT，判斷是否適合另開第二網 B
    - 不自動下單，只通知
 
-5. 長壽網格原則：
+5. 長壽網格原則（v3.2 資產分流）：
    - 生存 > 順趨勢 > 持續成交 > 短期報酬
    - 下沿不能貼現價
    - 依 ATR / 近期支撐動態放寬
@@ -60,6 +60,15 @@ EXTENDED = [
 ]
 REQUESTED = VALIDATED + EXTENDED
 
+CRYPTO_BASES = {
+    "BTC","ETH","XRP","SOL","BNB",
+    "ADA","LTC","LINK","DOGE","SUI","HYPE",
+}
+
+US_STOCK_PERP_BASES = {
+    "MU","VRT","DELL","NVDA","TSM","BRKB",
+}
+
 FOUR_H = 4 * 3600
 ONE_D = 24 * 3600
 
@@ -83,15 +92,65 @@ PRE_STRICT_GRID_A_PCT = 60
 STRICT_GRID_B_PCT = 40
 
 # 長壽網格生存參數
-MIN_LOWER_LOW_VOL_PCT = 10.0
-MIN_LOWER_MED_VOL_PCT = 15.0
-MIN_LOWER_HIGH_VOL_PCT = 20.0
-MAX_LOWER_DISTANCE_PCT = 30.0
+# 加密幣：允許較深回撤，重點是長壽
+CRYPTO_GRID_PROFILE = {
+    "LOW": {
+        "min_lower": 10.0,
+        "max_lower": 15.0,
+        "min_upper": 12.0,
+        "max_upper": 20.0,
+        "per_grid": 0.8,
+        "leverage": 3,
+    },
+    "MEDIUM": {
+        "min_lower": 15.0,
+        "max_lower": 22.0,
+        "min_upper": 15.0,
+        "max_upper": 26.0,
+        "per_grid": 1.0,
+        "leverage": 3,
+    },
+    "HIGH": {
+        "min_lower": 20.0,
+        "max_lower": 30.0,
+        "min_upper": 18.0,
+        "max_upper": 35.0,
+        "per_grid": 1.2,
+        "leverage": 2,
+    },
+}
 
-MIN_UPPER_LOW_VOL_PCT = 12.0
-MIN_UPPER_MED_VOL_PCT = 15.0
-MIN_UPPER_HIGH_VOL_PCT = 18.0
-MAX_UPPER_DISTANCE_PCT = 35.0
+# 美股永續：不要把網撒到海溝裡
+US_STOCK_GRID_PROFILE = {
+    "LOW": {
+        "min_lower": 8.0,
+        "max_lower": 12.0,
+        "min_upper": 10.0,
+        "max_upper": 16.0,
+        "per_grid": 0.7,
+        "leverage": 3,
+    },
+    "MEDIUM": {
+        "min_lower": 12.0,
+        "max_lower": 18.0,
+        "min_upper": 12.0,
+        "max_upper": 20.0,
+        "per_grid": 0.8,
+        "leverage": 3,
+    },
+    "HIGH": {
+        "min_lower": 15.0,
+        "max_lower": 22.0,
+        "min_upper": 15.0,
+        "max_upper": 24.0,
+        "per_grid": 1.0,
+        "leverage": 2,
+    },
+}
+
+# BRKB 額外收斂，避免低波動標的被拉太寬
+BRKB_MAX_LOWER_PCT = 15.0
+BRKB_MAX_UPPER_PCT = 18.0
 
 # 強平價要求：實際平台強平價至少再低於網格下沿 10%
 LIQ_BUFFER_BELOW_LOWER_PCT = 10.0
@@ -184,7 +243,7 @@ def gate_get(path, params=None, retries=5):
                 url,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "2560-cloud-monitor/3.1",
+                    "User-Agent": "2560-cloud-monitor/3.2",
                 },
             )
             with urllib.request.urlopen(req, timeout=30) as r:
@@ -479,6 +538,26 @@ def recent_high(rows, bars):
     return max((r["h"] for r in subset), default=None)
 
 
+def effective_support(rows, bars, quantile=0.10):
+    """
+    用近期低點分布的分位數當「有效支撐」，
+    避免單一極端插針把整張網格拖到太深。
+    """
+    subset = rows[-bars:] if len(rows) >= bars else rows
+    lows = sorted(r["l"] for r in subset if r.get("l") is not None)
+    if not lows:
+        return None
+    idx = int((len(lows) - 1) * quantile)
+    idx = max(0, min(idx, len(lows) - 1))
+    return lows[idx]
+
+
+def asset_class(base_symbol):
+    if base_symbol in US_STOCK_PERP_BASES:
+        return "US_STOCK_PERP"
+    return "CRYPTO"
+
+
 def vol_profile(atr_pct):
     if atr_pct is None:
         return "MEDIUM"
@@ -489,10 +568,15 @@ def vol_profile(atr_pct):
     return "HIGH"
 
 
-def longlife_grid_plan(r4, current_price, capital_pct):
+def longlife_grid_plan(base_symbol, r4, current_price, capital_pct):
     """
     生存優先的趨勢長壽多網格。
-    不把下沿硬貼在現價附近。
+
+    v3.2：
+    - Crypto 與 US-stock perpetual 使用不同風險尺
+    - 股票不再直接吃 30/60 日絕對最低點
+    - 改用近期「有效支撐」(低點分位數) + ATR 安全距離
+    - 再套資產類型最大回撤上限
     """
     latest = r4[-1]
     atr14 = latest.get("atr14")
@@ -501,96 +585,170 @@ def longlife_grid_plan(r4, current_price, capital_pct):
         atr_pct = atr14 / current_price * 100.0
 
     profile = vol_profile(atr_pct)
+    cls = asset_class(base_symbol)
 
-    if profile == "LOW":
-        min_lower = MIN_LOWER_LOW_VOL_PCT
-        min_upper = MIN_UPPER_LOW_VOL_PCT
-        per_grid_target = 0.8
-        leverage = 3
-    elif profile == "MEDIUM":
-        min_lower = MIN_LOWER_MED_VOL_PCT
-        min_upper = MIN_UPPER_MED_VOL_PCT
-        per_grid_target = 1.0
-        leverage = 3
+    if cls == "US_STOCK_PERP":
+        cfg = dict(US_STOCK_GRID_PROFILE[profile])
+        short_bars = 60
+        long_bars = 120
+        support_q = 0.10
+        resistance_bars = 90
+
+        # BRKB 額外縮窄
+        if base_symbol == "BRKB":
+            cfg["max_lower"] = min(cfg["max_lower"], BRKB_MAX_LOWER_PCT)
+            cfg["max_upper"] = min(cfg["max_upper"], BRKB_MAX_UPPER_PCT)
     else:
-        min_lower = MIN_LOWER_HIGH_VOL_PCT
-        min_upper = MIN_UPPER_HIGH_VOL_PCT
-        per_grid_target = 1.2
-        leverage = 2
+        cfg = dict(CRYPTO_GRID_PROFILE[profile])
+        short_bars = 180
+        long_bars = 360
+        support_q = 0.05
+        resistance_bars = 180
 
-    # ATR 越大，下沿越深。4 x 4H ATR 作基本壓力緩衝。
-    atr_lower = (atr_pct or 0.0) * 4.0
-    lower_distance = clamp(
+    min_lower = cfg["min_lower"]
+    max_lower = cfg["max_lower"]
+    min_upper = cfg["min_upper"]
+    max_upper = cfg["max_upper"]
+    per_grid_target = cfg["per_grid"]
+    leverage = cfg["leverage"]
+
+    # ATR 安全距離
+    # Crypto 允許較深，股票不讓 ATR 把區間拉到海溝
+    atr_mult = 4.0 if cls == "CRYPTO" else 3.0
+    atr_lower = (atr_pct or 0.0) * atr_mult
+
+    target_lower_distance = clamp(
         max(min_lower, atr_lower),
         min_lower,
-        MAX_LOWER_DISTANCE_PCT,
+        max_lower,
     )
 
-    # 30天約 180 根 4H；60天約 360 根。
-    support_30d = recent_low(r4, 180)
-    support_60d = recent_low(r4, 360)
+    support_short = effective_support(
+        r4,
+        short_bars,
+        support_q,
+    )
+    support_long = effective_support(
+        r4,
+        long_bars,
+        support_q,
+    )
 
-    pct_floor = current_price * (1.0 - lower_distance / 100.0)
+    pct_floor = current_price * (
+        1.0 - target_lower_distance / 100.0
+    )
 
-    support_candidates = [x for x in [support_30d, support_60d] if x is not None]
-    support_floor = min(support_candidates) if support_candidates else pct_floor
+    support_candidates = [
+        x for x in (support_short, support_long)
+        if x is not None and x < current_price
+    ]
 
-    # 支撐若更低，採更保守者；但避免無限拉寬，最多約 -30%
-    absolute_lower_cap = current_price * (1.0 - MAX_LOWER_DISTANCE_PCT / 100.0)
-    lower = min(pct_floor, support_floor * 0.995)
+    if support_candidates:
+        # 有效支撐採較保守者，但不准突破資產類型最大下沿
+        support_floor = min(support_candidates) * 0.995
+        lower = min(pct_floor, support_floor)
+    else:
+        lower = pct_floor
+
+    # 資產類型硬上限：股票不再允許一律 -30%
+    absolute_lower_cap = current_price * (
+        1.0 - max_lower / 100.0
+    )
     lower = max(lower, absolute_lower_cap)
 
-    actual_lower_pct = abs(pct_change(current_price, lower) or 0.0)
+    actual_lower_pct = abs(
+        pct_change(current_price, lower) or 0.0
+    )
 
-    # 上沿：近期壓力 + 趨勢延伸空間
-    resistance_30d = recent_high(r4, 180)
-    atr_upper = (atr_pct or 0.0) * 3.0
+    # 上沿：近期壓力 + 趨勢延伸
+    resistance = recent_high(r4, resistance_bars)
+
+    atr_upper_mult = 3.0 if cls == "CRYPTO" else 2.5
+    atr_upper = (atr_pct or 0.0) * atr_upper_mult
+
     upper_distance = clamp(
         max(min_upper, atr_upper),
         min_upper,
-        MAX_UPPER_DISTANCE_PCT,
+        max_upper,
     )
-    pct_ceiling = current_price * (1.0 + upper_distance / 100.0)
 
-    if resistance_30d is not None:
-        upper = max(pct_ceiling, resistance_30d * 1.01)
+    pct_ceiling = current_price * (
+        1.0 + upper_distance / 100.0
+    )
+
+    if resistance is not None and resistance > current_price:
+        upper = max(
+            pct_ceiling,
+            resistance * 1.01,
+        )
     else:
         upper = pct_ceiling
 
-    absolute_upper_cap = current_price * (1.0 + MAX_UPPER_DISTANCE_PCT / 100.0)
+    absolute_upper_cap = current_price * (
+        1.0 + max_upper / 100.0
+    )
     upper = min(upper, absolute_upper_cap)
-    actual_upper_pct = pct_change(current_price, upper)
 
-    # 等比格數，以目標單格毛幅估算
+    actual_upper_pct = pct_change(
+        current_price,
+        upper,
+    )
+
+    # 等比格數
     if lower > 0 and upper > lower:
         raw_grids = round(
             math.log(upper / lower)
-            / math.log(1.0 + per_grid_target / 100.0)
+            / math.log(
+                1.0 + per_grid_target / 100.0
+            )
         )
     else:
         raw_grids = 24
 
-    grids = int(clamp(raw_grids, 18, 40))
-    geometric_grid_pct = ((upper / lower) ** (1.0 / grids) - 1.0) * 100.0
+    # 股票區間較窄，避免動不動 40 格
+    max_grids = 32 if cls == "US_STOCK_PERP" else 40
+    grids = int(
+        clamp(
+            raw_grids,
+            18,
+            max_grids,
+        )
+    )
 
-    # 強平不是只靠K線能精確推算，所以給「平台實際強平價必須低於」的硬要求
-    required_liq_below = lower * (1.0 - LIQ_BUFFER_BELOW_LOWER_PCT / 100.0)
+    geometric_grid_pct = (
+        (upper / lower) ** (1.0 / grids)
+        - 1.0
+    ) * 100.0
 
-    # 20%級快速回撤能不能仍在區間內
+    required_liq_below = lower * (
+        1.0 - LIQ_BUFFER_BELOW_LOWER_PCT / 100.0
+    )
+
     flash20_price = current_price * 0.80
     flash20_inside = lower <= flash20_price
 
-    survival_pass = (
-        actual_lower_pct >= min_lower
-        and actual_lower_pct >= 10.0
-    )
+    # 股票不要求每張網都必須吃住 -20%，重點是合理長壽 + 資金效率
+    if cls == "US_STOCK_PERP":
+        survival_pass = (
+            actual_lower_pct >= min_lower
+            and actual_lower_pct <= max_lower + 0.01
+        )
+    else:
+        survival_pass = (
+            actual_lower_pct >= min_lower
+            and actual_lower_pct <= max_lower + 0.01
+        )
 
     return {
+        "asset_class": cls,
         "direction": "LONG_GRID",
         "entry_price": current_price,
         "lower": lower,
         "upper": upper,
-        "lower_distance_pct": pct_change(current_price, lower),
+        "lower_distance_pct": pct_change(
+            current_price,
+            lower,
+        ),
         "upper_distance_pct": actual_upper_pct,
         "grid_count": grids,
         "grid_mode": "GEOMETRIC",
@@ -600,14 +758,20 @@ def longlife_grid_plan(r4, current_price, capital_pct):
         "atr14": atr14,
         "atr_pct": atr_pct,
         "vol_profile": profile,
-        "support_30d": support_30d,
-        "support_60d": support_60d,
-        "resistance_30d": resistance_30d,
+        "support_short": support_short,
+        "support_long": support_long,
+        "support_short_bars": short_bars,
+        "support_long_bars": long_bars,
+        "resistance": resistance,
+        "max_lower_pct": max_lower,
+        "max_upper_pct": max_upper,
         "flash20_inside_grid": flash20_inside,
         "required_liquidation_below": required_liq_below,
         "liquidation_rule": (
-            f"平台實際強平價需 <= {price_text(required_liq_below)} "
-            f"(至少低於下沿 {LIQ_BUFFER_BELOW_LOWER_PCT:.0f}%)"
+            f"平台實際強平價需 <= "
+            f"{price_text(required_liq_below)} "
+            f"(至少低於下沿 "
+            f"{LIQ_BUFFER_BELOW_LOWER_PCT:.0f}%)"
         ),
         "survival_pass": survival_pass,
     }
@@ -689,12 +853,14 @@ def analyze(base_symbol, contract):
     grid = None
     if status == "PRE-STRICT":
         grid = longlife_grid_plan(
+            base_symbol,
             r4,
             latest["c"],
             PRE_STRICT_GRID_A_PCT,
         )
     elif status == "STRICT":
         grid = longlife_grid_plan(
+            base_symbol,
             r4,
             latest["c"],
             STRICT_GRID_B_PCT,
@@ -780,6 +946,7 @@ def format_grid(plan):
     )
 
     return (
+        f"資產類型：{plan.get('asset_class')}\n"
         f"方向：多網格\n"
         f"建議進場參考：{price_text(plan.get('entry_price'))}\n"
         f"下沿：{price_text(plan.get('lower'))} "
@@ -793,6 +960,9 @@ def format_grid(plan):
         f"建議投入：總預算 {plan.get('capital_pct')}%\n"
         f"4H ATR：{pct_text(plan.get('atr_pct'))}\n"
         f"波動級別：{plan.get('vol_profile')}\n"
+        f"近期有效支撐：{price_text(plan.get('support_short'))}\n"
+        f"較長有效支撐：{price_text(plan.get('support_long'))}\n"
+        f"本類型下沿上限：-{plan.get('max_lower_pct'):.1f}%\n"
         f"20%快速回撤：{flash}\n"
         f"強平安全要求：{plan.get('liquidation_rule')}\n"
         f"生存檢查：{survival}"
@@ -888,7 +1058,7 @@ def notify_status_change(r, state):
 # ============================================================
 
 def main():
-    print("2560 Cloud Monitor | PRE-STRICT Long-Life Grid v3.1")
+    print("2560 Cloud Monitor | PRE-STRICT Long-Life Grid v3.2")
     print("UTC:", now_iso())
     print(
         "Rule: NO_SIGNAL -> WATCH -> TREND_READY -> "
@@ -979,7 +1149,7 @@ def main():
         json.dumps(
             {
                 "generated_utc": now_iso(),
-                "rule_version": "2560_PRESTRICT_LONG_LIFE_GRID_V3_1",
+                "rule_version": "2560_PRESTRICT_LONG_LIFE_GRID_V3_2",
                 "results": results,
             },
             ensure_ascii=False,
