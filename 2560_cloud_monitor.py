@@ -2192,4 +2192,24 @@ def main():
                 "hk_rescanned_this_run": hk_should_scan,
                 "hk_gate_universe_count": len(hk_universe) if hk_should_scan else None,
                 "hk_fixed_pool_configured": len(HK_FIXED_CODES),
-                "hk_fixed_pool_available": len(hk_candidates) if hk
+                "hk_fixed_pool_available": len(hk_candidates) if hk_should_scan else None,
+                "results": results,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    save_state(state)
+
+    counts = Counter(r.get("status") for r in results)
+    print("\nSTATUS COUNTS:", dict(counts))
+    print("SYMBOL COUNT:", len(results))
+    print("ERROR COUNT:", len(errors))
+    print("STATE FILE:", STATE_FILE)
+    print("RESULT FILE:", RESULT_FILE)
+
+
+if __name__ == "__main__":
+    main()
