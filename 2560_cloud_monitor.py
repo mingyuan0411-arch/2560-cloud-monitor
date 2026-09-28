@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-2560 Cloud Monitor v3.4 — PRE-STRICT Long-Life Grid
+2560 Cloud Monitor FINAL 2026-09-28R2 — Multi-Timeframe + HK Stock + Target
 ===================================================
 
 用途
@@ -37,6 +37,14 @@
    - 依 ATR / 近期支撐動態放寬
    - 強平價需由平台實際畫面確認，並明顯低於下沿
 
+6. Gate 港股 2560（R2）：
+   - 只接受 Gate /stock/symbols?exchange=hk 股票白名單
+   - 日K = 戰略方向
+   - 1H = 波段結構
+   - 15m = 進場窗口
+   - 產生合理目標區
+   - 不把港股現股偽裝成 USDT/PERP/FUTURES，也不自動建立槓桿網格
+
 Public market data only. No API key. No order placement.
 """
 
@@ -69,10 +77,50 @@ US_STOCK_PERP_BASES = {
     "MU","VRT","DELL","NVDA","TSM","BRKB",
 }
 
+HK_STOCK_BASES = {
+    "TENCENT","XIAOMI","MEITUAN","KUAISHOU","HKEX","SMIC",
+    "BYD","CATL","YOFC","ZIJINMINING",
+}
+
+HK_STOCK = [
+    "TENCENT","XIAOMI","MEITUAN","KUAISHOU","HKEX","SMIC",
+    "BYD","CATL","YOFC","ZIJINMINING",
+]
+
+HK_ALIASES = {
+    "TENCENT": ["TENCENT", "700", "0700"],
+    "XIAOMI": ["XIAOMI", "1810"],
+    "MEITUAN": ["MEITUAN", "3690"],
+    "KUAISHOU": ["KUAISHOU", "1024"],
+    "HKEX": ["HKEX", "0388", "388"],
+    "SMIC": ["SMIC", "0981", "981"],
+    "BYD": ["BYD", "1211"],
+    "CATL": ["CATL", "3750"],
+    "YOFC": ["YOFC", "6869"],
+    "ZIJINMINING": ["ZIJINMINING", "2899"],
+}
+
+HK_YAHOO = {
+    "TENCENT": "0700.HK",
+    "XIAOMI": "1810.HK",
+    "MEITUAN": "3690.HK",
+    "KUAISHOU": "1024.HK",
+    "HKEX": "0388.HK",
+    "SMIC": "0981.HK",
+    "BYD": "1211.HK",
+    "CATL": "3750.HK",
+    "YOFC": "6869.HK",
+    "ZIJINMINING": "2899.HK",
+}
+
+ONE_H = 3600
+FIFTEEN_M = 15 * 60
 FOUR_H = 4 * 3600
 ONE_D = 24 * 3600
 
 # 長壽網格需要更長的波動/支撐樣本
+LIMIT_1H = 240
+LIMIT_15M = 240
 LIMIT_4H = 600
 LIMIT_1D = 220
 DEDUP_BARS = 20
@@ -257,7 +305,7 @@ def gate_get(path, params=None, retries=5):
                 url,
                 headers={
                     "Accept": "application/json",
-                    "User-Agent": "2560-cloud-monitor/3.4",
+                    "User-Agent": "2560-cloud-monitor/final-r2",
                 },
             )
             with urllib.request.urlopen(req, timeout=30) as r:
@@ -303,6 +351,122 @@ def discover_contracts():
         mapping[base] = found
 
     return mapping
+
+
+def discover_hk_stock_symbols():
+    """Gate 股票區港股白名單。只有 exchange=hk 真正存在者才啟用。"""
+    try:
+        payload = gate_get(
+            "/stock/symbols",
+            {"exchange": "hk", "with_desc_i18n": "false"},
+        )
+    except Exception as e:
+        print(f"HK STOCK WHITELIST ERROR: {e}")
+        return {symbol: None for symbol in HK_STOCK}
+
+    data = payload.get("data", {}) if isinstance(payload, dict) else {}
+    items = data.get("list", []) if isinstance(data, dict) else []
+    available = {}
+    for item in items:
+        raw = str(item.get("symbol", "") or "")
+        if raw:
+            available.setdefault(norm(raw), raw)
+
+    mapping = {}
+    for symbol in HK_STOCK:
+        found = None
+        for cand in HK_ALIASES.get(symbol, [symbol]):
+            keys = [norm(cand)]
+            digits = re.sub(r"\D", "", str(cand))
+            if digits:
+                keys += [digits.lstrip("0"), digits.zfill(4), digits.zfill(5)]
+            for key in keys:
+                if not key:
+                    continue
+                if key in available:
+                    found = available[key]
+                    break
+                if key.isdigit():
+                    for av_key, raw in available.items():
+                        if av_key.isdigit() and av_key.lstrip("0") == key.lstrip("0"):
+                            found = raw
+                            break
+                if found:
+                    break
+            if found:
+                break
+        mapping[symbol] = found if (found and HK_YAHOO.get(symbol)) else None
+    return mapping
+
+
+YAHOO_HOSTS = [
+    "https://query1.finance.yahoo.com",
+    "https://query2.finance.yahoo.com",
+]
+
+
+def yahoo_get(symbol, interval, range_text, retries=4):
+    params = urllib.parse.urlencode({
+        "interval": interval,
+        "range": range_text,
+        "includePrePost": "false",
+        "events": "div,splits",
+    })
+    last = None
+    for attempt in range(retries):
+        host = YAHOO_HOSTS[attempt % len(YAHOO_HOSTS)]
+        url = f"{host}/v8/finance/chart/{urllib.parse.quote(symbol)}?{params}"
+        try:
+            req = urllib.request.Request(
+                url,
+                headers={
+                    "Accept": "application/json",
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/124 Safari/537.36",
+                },
+            )
+            with urllib.request.urlopen(req, timeout=25) as r:
+                data = json.load(r)
+            result = data.get("chart", {}).get("result")
+            if not result:
+                raise RuntimeError(f"Yahoo no result: {data.get('chart', {}).get('error')}")
+            return result[0]
+        except Exception as e:
+            last = e
+            time.sleep(min(2 ** attempt, 6))
+    raise RuntimeError(f"Yahoo request failed: {last}")
+
+
+def fetch_hk_stock(base_symbol, interval):
+    y = HK_YAHOO.get(base_symbol)
+    if not y:
+        raise RuntimeError(f"HK Yahoo symbol missing: {base_symbol}")
+
+    if interval == "1d":
+        yi, yr = "1d", "2y"
+    elif interval == "1h":
+        yi, yr = "60m", "3mo"
+    elif interval == "15m":
+        yi, yr = "15m", "60d"
+    else:
+        raise RuntimeError(f"unsupported HK interval: {interval}")
+
+    data = yahoo_get(y, yi, yr)
+    ts = data.get("timestamp") or []
+    q = (data.get("indicators", {}).get("quote") or [{}])[0]
+    opens=q.get("open") or []; highs=q.get("high") or []; lows=q.get("low") or []
+    closes=q.get("close") or []; vols=q.get("volume") or []
+    rows=[]
+    for i,t in enumerate(ts):
+        try:
+            o,h,l,c=opens[i],highs[i],lows[i],closes[i]
+            v=vols[i] if i < len(vols) else 0
+        except IndexError:
+            continue
+        if None in (o,h,l,c):
+            continue
+        rows.append({"t":int(t),"o":float(o),"h":float(h),"l":float(l),"c":float(c),"v":float(v or 0)})
+    rows.sort(key=lambda z:z["t"])
+    return rows
 
 
 def fetch(contract, interval, limit):
@@ -536,6 +700,126 @@ def classify_status(latest, d, strict_now, history_mode="FULL_1D"):
         return "WATCH"
 
     return "NO_SIGNAL"
+
+
+# ============================================================
+# HK 2560 stock logic: 1D strategy + 1H wave + 15m entry
+# ============================================================
+
+def hk_daily_strategy_ok(r):
+    need=[r.get("ma25"),r.get("ma25_prev"),r.get("vma5"),r.get("vma60")]
+    if any(x is None for x in need):
+        return False
+    return (
+        r["c"] > r["ma25"]
+        and r["ma25"] >= r["ma25_prev"]
+        and r["vma5"] >= r["vma60"] * 0.90
+    )
+
+
+def hk_hour_wave_ok(r):
+    need=[r.get("ma25"),r.get("ma25_prev"),r.get("vma5"),r.get("vma60")]
+    if any(x is None for x in need):
+        return False
+    return (
+        r["c"] >= r["ma25"] * 0.995
+        and r["ma25"] >= r["ma25_prev"] * 0.995
+        and (r["vma5"] >= r["vma60"] * 0.90 or r["vma5"] > r.get("vma5_prev",0))
+    )
+
+
+def hk_entry_15m_ok(r):
+    need=[r.get("ma25"),r.get("ma25_prev"),r.get("vma5"),r.get("vma60")]
+    if any(x is None for x in need):
+        return False
+    return (
+        r["c"] >= r["ma25"] * 0.992
+        and r["ma25"] >= r["ma25_prev"] * 0.992
+        and r["vma5"] >= r["vma60"] * 0.85
+    )
+
+
+def hk_target_zone(rd, r1, current):
+    atr = r1[-1].get("atr14") if r1 else None
+    atr_pct = (atr/current*100.0) if atr and current else None
+    h1 = sorted({x["h"] for x in r1[-90:] if x["h"] > current})
+    hd = sorted({x["h"] for x in rd[-120:] if x["h"] > current})
+    allh = sorted(h1 + hd)
+    near = allh[0] if allh else None
+    major = allh[-1] if allh else None
+    atr1 = current + (atr or current*0.015)*1.5
+    atr2 = current + (atr or current*0.015)*2.5
+    candidates_low=[x for x in (near,atr1) if x is not None]
+    base=max(current,min(candidates_low)) if candidates_low else current
+    candidates_high=[x for x in (major,atr2) if x is not None]
+    high=max(base,min(candidates_high)) if candidates_high else base
+    high=min(high,current*1.18)
+    base=min(base,high)
+    return {
+        "target_low":base,
+        "target_base":base,
+        "target_high":high,
+        "expected_base_pct":pct_change(current,base),
+        "expected_high_pct":pct_change(current,high),
+        "nearest_resistance":near,
+        "major_resistance":major,
+        "atr_pct":atr_pct,
+    }
+
+
+def analyze_hk_stock(base_symbol, gate_stock_symbol):
+    now=int(datetime.now(timezone.utc).timestamp())
+    rd=completed_only(fetch_hk_stock(base_symbol,"1d"), ONE_D, now)
+    r1=completed_only(fetch_hk_stock(base_symbol,"1h"), ONE_H, now)
+    r15=completed_only(fetch_hk_stock(base_symbol,"15m"), FIFTEEN_M, now)
+
+    if len(rd)<65 or len(r1)<65 or len(r15)<65:
+        return {
+            "base":base_symbol,
+            "contract":gate_stock_symbol,
+            "market_type":"HK_STOCK",
+            "group":"HK_STOCK",
+            "status":"WAIT_HISTORY",
+            "history_1d_bars":len(rd),
+            "history_1h_bars":len(r1),
+            "history_15m_bars":len(r15),
+        }
+
+    add_ind(rd,ONE_D); add_ind(r1,ONE_H); add_ind(r15,FIFTEEN_M)
+    d=rd[-1]; h=r1[-1]; m=r15[-1]
+    strategic=hk_daily_strategy_ok(d)
+    wave=hk_hour_wave_ok(h)
+    timing=hk_entry_15m_ok(m)
+
+    if strategic and wave and timing:
+        status="STRICT"
+    elif strategic and wave:
+        status="PRE-STRICT"
+    elif strategic:
+        status="TREND_READY"
+    elif wave:
+        status="WATCH"
+    else:
+        status="NO_SIGNAL"
+
+    target=hk_target_zone(rd,r1,m["c"])
+    return {
+        "base":base_symbol,
+        "contract":gate_stock_symbol,
+        "market_type":"HK_STOCK",
+        "group":"HK_STOCK",
+        "status":status,
+        "history_mode":"HK_1D_1H_15M",
+        "strict_allowed":True,
+        "latest_close":m["c"],
+        "1d_strategy":strategic,
+        "1h_wave":wave,
+        "15m_entry":timing,
+        "lower_entry_timing":timing,
+        "expected_target":target,
+        "grid":None,
+        "hk_note":"Gate股票區港股；不套用USDT永續4H STRICT，也不自動建立槓桿網格。",
+    }
 
 
 # ============================================================
@@ -918,6 +1202,37 @@ def longlife_grid_plan(base_symbol, r4, current_price, capital_pct):
 
 
 # ============================================================
+# Multi-timeframe timing + expected target
+# ============================================================
+
+def lower_entry_timing(r1, r15):
+    """1D=戰略、4H=波段；1H/15m只負責進場，不要求全週期均線同向。"""
+    need1=[r1.get("ma5"),r1.get("ma10"),r1.get("ma20"),r1.get("ma20_prev")]
+    need15=[r15.get("ma5"),r15.get("ma10"),r15.get("ma20")]
+    if any(x is None for x in need1+need15): return False
+    h1=(r1["c"] >= r1["ma20"]*0.990 and r1["ma20"] >= r1["ma20_prev"]*0.995 and r1["ma5"] >= r1["ma10"]*0.985)
+    m15=(r15["c"] >= r15["ma20"]*0.992 and r15["ma5"] >= r15["ma10"]*0.985)
+    return h1 and m15
+
+def expected_target_zone(r4, rd, current):
+    """非固定百分比：綜合4H ATR、4H/1D前高與上級趨勢估合理目標區。"""
+    atr=r4[-1].get("atr14") if r4 else None
+    atr_pct=(atr/current*100.0) if atr and current else None
+    highs4=sorted({x["h"] for x in r4[-90:] if x["h"]>current})
+    highsd=sorted({x["h"] for x in rd[-90:] if x["h"]>current}) if rd else []
+    resistance=(highs4+highsd)
+    resistance=sorted(resistance)[0] if resistance else None
+    major=sorted(highs4+highsd)[-1] if (highs4 or highsd) else None
+    atr1=current+(atr or current*0.02)*1.5
+    atr2=current+(atr or current*0.02)*2.5
+    base=max(current, min([x for x in (resistance,atr1) if x is not None]))
+    high=max(base, min([x for x in (major,atr2) if x is not None]))
+    # 防止單一歷史尖峰把目標拉到天邊，但不是用固定%產生目標，只作異常值護欄。
+    high=min(high,current*1.20)
+    base=min(base,high)
+    return {"target_low":base,"target_base":base,"target_high":high,"expected_base_pct":pct_change(current,base),"expected_high_pct":pct_change(current,high),"nearest_resistance":resistance,"major_resistance":major,"atr_pct":atr_pct}
+
+# ============================================================
 # Analysis
 # ============================================================
 
@@ -934,9 +1249,11 @@ def analyze(base_symbol, contract):
         ONE_D,
         now,
     )
+    r1 = completed_only(fetch(contract, "1h", LIMIT_1H), ONE_H, now)
+    r15 = completed_only(fetch(contract, "15m", LIMIT_15M), FIFTEEN_M, now)
 
     # 4H 至少要能算 MA120；不足才是真正 WAIT_HISTORY。
-    if len(r4) < 121:
+    if len(r4) < 121 or len(r1) < 65 or len(r15) < 65:
         return {
             "base": base_symbol,
             "contract": contract,
@@ -952,6 +1269,8 @@ def analyze(base_symbol, contract):
         }
 
     add_ind(r4, FOUR_H)
+    add_ind(r1, ONE_H)
+    add_ind(r15, FIFTEEN_M)
 
     # 1D >= 61：完整 canonical 2560 日線確認。
     # 25~60：可做 MA25 soft 判斷，但 STRICT 暫不開放。
@@ -989,6 +1308,13 @@ def analyze(base_symbol, contract):
         strict_now,
         history_mode,
     )
+
+    timing_ok = lower_entry_timing(r1[-1], r15[-1])
+    # 上級方向成立但下級尚未到進場窗口時，不硬砍趨勢，只降回 TREND_READY/WATCH。
+    if status in ("PRE-STRICT", "STRICT") and not timing_ok:
+        status = "TREND_READY"
+
+    target_zone = expected_target_zone(r4, rd if history_mode != "4H_PROXY" else [], latest["c"])
 
     grid = None
     if status == "PRE-STRICT":
@@ -1039,6 +1365,8 @@ def analyze(base_symbol, contract):
         "1d_confirm": dconfirm,
         "strict_raw": raw_now,
         "strict": strict_now,
+        "lower_entry_timing": timing_ok,
+        "expected_target": target_zone,
         "grid": grid,
     }
 
@@ -1124,20 +1452,33 @@ def format_grid(plan):
     )
 
 
+
+def format_target(t):
+    t=t or {}
+    return (
+        f"合理目標基準：{price_text(t.get('target_base'))} ({pct_text(t.get('expected_base_pct'))})\n"
+        f"合理目標上緣：{price_text(t.get('target_high'))} ({pct_text(t.get('expected_high_pct'))})\n"
+        f"最近壓力：{price_text(t.get('nearest_resistance'))}\n"
+        f"主要壓力：{price_text(t.get('major_resistance'))}\n"
+        f"4H ATR：{pct_text(t.get('atr_pct'))}"
+    )
+
 def notify_pre_strict(r):
     g = r.get("grid")
     msg = (
         f"{r['base']} 2560 PRE-STRICT\n\n"
         f"定位：第一段可開網候選\n"
         f"現價：{price_text(r.get('latest_close'))}\n"
-        f"4H結構：{r.get('4h_structure')}\n"
-        f"4H放寬量能：{r.get('4h_relaxed_volume')}\n"
-        f"1D soft：{r.get('1d_soft')}\n"
+        f"4H結構：{r.get('4h_structure', 'N/A')}\n"
+        f"4H放寬量能：{r.get('4h_relaxed_volume', 'N/A')}\n"
+        f"1D soft：{r.get('1d_soft', r.get('1d_strategy', 'N/A'))}\n"
         f"歷史模式：{r.get('history_mode')} "
         f"(4H={r.get('history_4h_bars')} / 1D={r.get('history_1d_bars')})\n"
-        f"STRICT可用：{r.get('strict_allowed')}\n\n"
-        f"【長壽網格 A】\n"
-        f"{format_grid(g)}\n\n"
+        f"STRICT可用：{r.get('strict_allowed')}\n"
+        f"1H/15m進場窗口：{r.get('lower_entry_timing')}\n\n"
+        f"【合理目標區】\n{format_target(r.get('expected_target'))}\n\n"
+        f"【執行方式】\n"
+        f"{('Gate港股股票區：只做現股趨勢候選，不建立USDT永續槓桿網格。' if r.get('market_type') == 'HK_STOCK' else format_grid(g))}\n\n"
         f"{'⚠ 短歷史標的：可作 PRE-STRICT 第一網候選，但在 1D 歷史滿 61 根前不產生 STRICT。\\n' if not r.get('strict_allowed') else ''}"
         f"原則：寧可寬一點、少成交幾格，也不要下沿太貼現價。"
     )
@@ -1154,7 +1495,9 @@ def notify_strict(r, symbol_state):
     pre_price = symbol_state.get("pre_strict_entry_price")
     rise = pct_change(pre_price, r.get("latest_close"))
 
-    if pre_price is None:
+    if r.get("market_type") == "HK_STOCK":
+        add_decision = "港股現股 STRICT：日K戰略、1H波段、15m進場三層確認；不建立第二槓桿網。"
+    elif pre_price is None:
         add_decision = "沒有記錄到前一個 PRE-STRICT；第二網需人工重新評估。"
     elif rise is not None and rise <= STRICT_ADD_MAX_RISE_PCT:
         add_decision = (
@@ -1173,10 +1516,12 @@ def notify_strict(r, symbol_state):
         f"定位：趨勢確認 / 第二網審核點\n"
         f"現價：{price_text(r.get('latest_close'))}\n"
         f"PRE-STRICT價：{price_text(pre_price)}\n"
-        f"漲幅：{pct_text(rise)}\n\n"
+        f"漲幅：{pct_text(rise)}\n"
+        f"1H/15m進場窗口：{r.get('lower_entry_timing')}\n\n"
+        f"【合理目標區】\n{format_target(r.get('expected_target'))}\n\n"
         f"第二網判斷：{add_decision}\n\n"
-        f"【若允許開網 B，重新依當下行情計算】\n"
-        f"{format_grid(g)}"
+        f"【執行方式】\n"
+        f"{('Gate港股股票區：STRICT=日K/1H/15m趨勢確認，只做現股候選。' if r.get('market_type') == 'HK_STOCK' else format_grid(g))}"
     )
     send_ntfy(
         f"2560 STRICT {r['base']}",
@@ -1213,7 +1558,7 @@ def notify_status_change(r, state):
 # ============================================================
 
 def main():
-    print("2560 Cloud Monitor | PRE-STRICT Long-Life Grid v3.4")
+    print("2560 Cloud Monitor | FINAL 2026-09-28R2")
     print("UTC:", now_iso())
     print(
         "Rule: NO_SIGNAL -> WATCH -> TREND_READY -> "
@@ -1226,10 +1571,15 @@ def main():
 
     state = load_state()
     contract_map = discover_contracts()
+    hk_stock_map = discover_hk_stock_symbols()
 
     print("\nCONTRACT MAP")
     for base in REQUESTED:
-        print(f"{base:<5} -> {contract_map.get(base)}")
+        print(f"{base:<12} -> {contract_map.get(base)}")
+
+    print("\nGATE HK STOCK MAP")
+    for base in HK_STOCK:
+        print(f"{base:<12} -> {hk_stock_map.get(base)}")
 
     results = []
     errors = []
@@ -1303,11 +1653,36 @@ def main():
 
         time.sleep(0.15)
 
+    print("\nSCAN HK STOCK 2560")
+    for base in HK_STOCK:
+        gate_symbol = hk_stock_map.get(base)
+        if not gate_symbol:
+            print(f"{base:<12} NOT_FOUND_IN_GATE_STOCK")
+            results.append({"base":base,"group":"HK_STOCK","status":"NOT_FOUND"})
+            continue
+        try:
+            r=analyze_hk_stock(base,gate_symbol)
+            results.append(r)
+            if r.get("status") == "WAIT_HISTORY":
+                print(f"{base:<12} WAIT_HISTORY 1D={r.get('history_1d_bars')} 1H={r.get('history_1h_bars')} 15m={r.get('history_15m_bars')}")
+            else:
+                print(
+                    f"{base:<12} {r['status']:<12} close={price_text(r.get('latest_close'))} "
+                    f"1D={r.get('1d_strategy')} 1H={r.get('1h_wave')} 15m={r.get('15m_entry')} "
+                    f"target={price_text((r.get('expected_target') or {}).get('target_base'))}~{price_text((r.get('expected_target') or {}).get('target_high'))}"
+                )
+            notify_status_change(r,state)
+        except Exception as e:
+            errors.append((base,str(e)))
+            print(f"{base:<12} ERROR {e}")
+            results.append({"base":base,"group":"HK_STOCK","status":"ERROR","error":str(e)})
+        time.sleep(0.15)
+
     RESULT_FILE.write_text(
         json.dumps(
             {
                 "generated_utc": now_iso(),
-                "rule_version": "2560_PRESTRICT_LONG_LIFE_GRID_V3_4",
+                "rule_version": "2560_FINAL_2026_09_28_R2_HK",
                 "results": results,
             },
             ensure_ascii=False,
