@@ -354,48 +354,119 @@ def discover_contracts():
 
 
 def discover_hk_stock_symbols():
-    """Gate 股票區港股白名單。只有 exchange=hk 真正存在者才啟用。"""
+    """Gate 股票區港股白名單。
+
+    修正版：
+    - 明確指定 page_size=500，避免 API 預設只回第一小頁。
+    - 依 total_page 自動翻頁；若沒有 total_page，持續抓到空頁或不足 page_size。
+    - 只接受 exchange=hk 回傳的股票，不碰 USDT/PERP/FUTURES。
+    - 額外輸出總抓取數與成功對應數，方便 GitHub Actions 直接驗證。
+    """
+
+    all_items = []
+    page = 1
+    page_size = 500
+    max_pages = 50
+
     try:
-        payload = gate_get(
-            "/stock/symbols",
-            {"exchange": "hk", "with_desc_i18n": "false"},
-        )
+        while page <= max_pages:
+            payload = gate_get(
+                "/stock/symbols",
+                {
+                    "exchange": "hk",
+                    "with_desc_i18n": "false",
+                    "page": page,
+                    "page_size": page_size,
+                },
+            )
+
+            data = payload.get("data", {}) if isinstance(payload, dict) else {}
+            items = data.get("list", []) if isinstance(data, dict) else []
+
+            if not items:
+                break
+
+            all_items.extend(items)
+
+            total_page = None
+            if isinstance(data, dict):
+                total_page = data.get("total_page")
+                if total_page is None:
+                    total_page = data.get("total_pages")
+
+            try:
+                total_page = int(total_page) if total_page is not None else None
+            except (TypeError, ValueError):
+                total_page = None
+
+            if total_page is not None:
+                if page >= total_page:
+                    break
+            elif len(items) < page_size:
+                break
+
+            page += 1
+
     except Exception as e:
         print(f"HK STOCK WHITELIST ERROR: {e}")
         return {symbol: None for symbol in HK_STOCK}
 
-    data = payload.get("data", {}) if isinstance(payload, dict) else {}
-    items = data.get("list", []) if isinstance(data, dict) else []
+    # 去重，避免翻頁或 API 排序造成重複。
     available = {}
-    for item in items:
-        raw = str(item.get("symbol", "") or "")
-        if raw:
-            available.setdefault(norm(raw), raw)
+    for item in all_items:
+        raw = str(item.get("symbol", "") or "").strip()
+        if not raw:
+            continue
+
+        raw_norm = norm(raw)
+        available.setdefault(raw_norm, raw)
+
+        # 某些市場代號可能帶 HK / 股票所前後綴。
+        # 同時建立純數字索引，讓 700 / 0700 / 00700 都能互認。
+        digits = re.sub(r"\D", "", raw)
+        if digits:
+            available.setdefault(digits, raw)
+            available.setdefault(digits.lstrip("0") or "0", raw)
+            available.setdefault(digits.zfill(4), raw)
+            available.setdefault(digits.zfill(5), raw)
 
     mapping = {}
+
     for symbol in HK_STOCK:
         found = None
+
         for cand in HK_ALIASES.get(symbol, [symbol]):
-            keys = [norm(cand)]
+            keys = []
+            cand_norm = norm(cand)
+            if cand_norm:
+                keys.append(cand_norm)
+
             digits = re.sub(r"\D", "", str(cand))
             if digits:
-                keys += [digits.lstrip("0"), digits.zfill(4), digits.zfill(5)]
-            for key in keys:
-                if not key:
-                    continue
+                keys.extend([
+                    digits,
+                    digits.lstrip("0") or "0",
+                    digits.zfill(4),
+                    digits.zfill(5),
+                ])
+
+            for key in dict.fromkeys(keys):
                 if key in available:
                     found = available[key]
                     break
-                if key.isdigit():
-                    for av_key, raw in available.items():
-                        if av_key.isdigit() and av_key.lstrip("0") == key.lstrip("0"):
-                            found = raw
-                            break
-                if found:
-                    break
+
             if found:
                 break
+
+        # Gate 股票白名單與 Yahoo 港股現貨代號都必須存在才啟用。
         mapping[symbol] = found if (found and HK_YAHOO.get(symbol)) else None
+
+    matched = sum(1 for v in mapping.values() if v)
+    print(
+        f"HK STOCK WHITELIST LOADED: rows={len(all_items)} "
+        f"matched={matched}/{len(HK_STOCK)} pages={page}"
+    )
+
     return mapping
 
 
@@ -1558,7 +1629,7 @@ def notify_status_change(r, state):
 # ============================================================
 
 def main():
-    print("2560 Cloud Monitor | FINAL 2026-09-28R2")
+    print("2560 Cloud Monitor | FINAL 2026-09-28 HK FIX")
     print("UTC:", now_iso())
     print(
         "Rule: NO_SIGNAL -> WATCH -> TREND_READY -> "
@@ -1682,7 +1753,7 @@ def main():
         json.dumps(
             {
                 "generated_utc": now_iso(),
-                "rule_version": "2560_FINAL_2026_09_28_R2_HK",
+                "rule_version": "2560_FINAL_2026_09_28_HK_PAGINATION_FIX",
                 "results": results,
             },
             ensure_ascii=False,
