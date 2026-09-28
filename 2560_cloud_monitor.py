@@ -217,8 +217,17 @@ def mark_hk_scan_done(state, reason, token):
     meta["last_scan_utc"] = now_iso()
 
 
-def load_previous_hk_results():
-    """非掃描時段沿用上一輪港股結果，避免結果檔被清空。"""
+def load_previous_hk_results(state):
+    """
+    非掃描時段沿用上一輪港股結果。
+    GitHub Actions 每輪是新 runner，所以不能只依賴 2560_latest.json；
+    優先從會被 workflow 保存/還原的 state 讀取。
+    """
+    cached = state.get("hk_last_results")
+    if isinstance(cached, list) and cached:
+        return cached
+
+    # 本機或同一 runner 的 fallback
     if not RESULT_FILE.exists():
         return []
 
@@ -1959,7 +1968,7 @@ def notify_status_change(r, state):
 # ============================================================
 
 def main():
-    print("2560 Cloud Monitor | FINAL 2026-09-28 HK SMART SCAN")
+    print("2560 Cloud Monitor | FINAL 2026-09-28 HK SMART SCAN STATE")
     print("UTC:", now_iso())
     print(
         "Rule: NO_SIGNAL -> WATCH -> TREND_READY -> "
@@ -2150,6 +2159,13 @@ def main():
         # 個別股票錯誤仍保留，但不阻止下個 15m bucket 繼續掃。
         mark_hk_scan_done(state, hk_scan_reason, hk_scan_token)
 
+        # 將本輪港股結果寫進 state，讓下一個 GitHub runner 在非交易時段可沿用。
+        state["hk_last_results"] = [
+            r for r in results
+            if r.get("group") == "HK_STOCK"
+        ]
+        state["hk_last_results_updated_utc"] = now_iso()
+
         print(
             "HK SCAN COMPLETE:",
             f"reason={hk_scan_reason}",
@@ -2158,7 +2174,7 @@ def main():
         )
 
     else:
-        previous_hk = load_previous_hk_results()
+        previous_hk = load_previous_hk_results(state)
         results.extend(previous_hk)
         print(
             "HK SCAN SKIPPED:",
@@ -2170,30 +2186,10 @@ def main():
         json.dumps(
             {
                 "generated_utc": now_iso(),
-                "rule_version": "2560_FINAL_2026_09_28_HK_SMART_SCAN",
+                "rule_version": "2560_FINAL_2026_09_28_HK_SMART_SCAN_STATE",
                 "hk_scan_reason": hk_scan_reason,
                 "hk_scan_token": hk_scan_token,
                 "hk_rescanned_this_run": hk_should_scan,
                 "hk_gate_universe_count": len(hk_universe) if hk_should_scan else None,
                 "hk_fixed_pool_configured": len(HK_FIXED_CODES),
-                "hk_fixed_pool_available": len(hk_candidates) if hk_should_scan else None,
-                "results": results,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    save_state(state)
-
-    counts = Counter(r.get("status") for r in results)
-    print("\nSTATUS COUNTS:", dict(counts))
-    print("SYMBOL COUNT:", len(results))
-    print("ERROR COUNT:", len(errors))
-    print("STATE FILE:", STATE_FILE)
-    print("RESULT FILE:", RESULT_FILE)
-
-
-if __name__ == "__main__":
-    main()
+                "hk_fixed_pool_available": len(hk_candidates) if hk
