@@ -213,6 +213,8 @@ def mark_hk_scan_done(state, reason, token):
         meta["last_intraday_bucket"] = token
     elif reason == "CLOSE_CONFIRM":
         meta["last_close_confirm_date"] = token
+    elif reason == "BOOTSTRAP_EMPTY_CACHE":
+        meta["last_bootstrap_date"] = token
     meta["last_scan_reason"] = reason
     meta["last_scan_utc"] = now_iso()
 
@@ -1968,7 +1970,7 @@ def notify_status_change(r, state):
 # ============================================================
 
 def main():
-    print("2560 Cloud Monitor | FINAL 2026-09-28 HK SMART SCAN STATE")
+    print("2560 Cloud Monitor | FINAL 2026-09-28 HK SMART SCAN BOOTSTRAP")
     print("UTC:", now_iso())
     print(
         "Rule: NO_SIGNAL -> WATCH -> TREND_READY -> "
@@ -1983,6 +1985,17 @@ def main():
     contract_map = discover_contracts()
 
     hk_should_scan, hk_scan_reason, hk_scan_token = hk_scan_decision(state)
+
+    # 首次啟用 / state 被清空時，如果沒有任何港股 cache，
+    # 即使目前是非交易時段，也破例完整掃一次建立基準結果。
+    cached_hk = state.get("hk_last_results")
+    hk_bootstrap_cache = not (isinstance(cached_hk, list) and len(cached_hk) > 0)
+
+    if (not hk_should_scan) and hk_bootstrap_cache:
+        hk_should_scan = True
+        hk_scan_reason = "BOOTSTRAP_EMPTY_CACHE"
+        hk_scan_token = hk_now().date().isoformat()
+
     hk_universe = []
     hk_candidates = []
 
@@ -1992,6 +2005,7 @@ def main():
         f"scan={hk_should_scan}",
         f"reason={hk_scan_reason}",
         f"token={hk_scan_token}",
+        f"cached={0 if not isinstance(cached_hk, list) else len(cached_hk)}",
     )
 
     if hk_should_scan:
@@ -2186,7 +2200,7 @@ def main():
         json.dumps(
             {
                 "generated_utc": now_iso(),
-                "rule_version": "2560_FINAL_2026_09_28_HK_SMART_SCAN_STATE",
+                "rule_version": "2560_FINAL_2026_09_28_HK_SMART_SCAN_BOOTSTRAP",
                 "hk_scan_reason": hk_scan_reason,
                 "hk_scan_token": hk_scan_token,
                 "hk_rescanned_this_run": hk_should_scan,
