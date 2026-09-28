@@ -56,6 +56,7 @@ import time
 import urllib.parse
 import urllib.request
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -77,41 +78,53 @@ US_STOCK_PERP_BASES = {
     "MU","VRT","DELL","NVDA","TSM","BRKB",
 }
 
-HK_STOCK_BASES = {
-    "TENCENT","XIAOMI","MEITUAN","KUAISHOU","HKEX","SMIC",
-    "BYD","CATL","YOFC","ZIJINMINING",
+# 港股核心追蹤股：永遠保留，不受固定池排名淘汰。
+# 固定港股池會另外把 Gate 股票區所有 HK common stocks 納入第一階段日K篩選。
+HK_FIXED_CODES = {
+    # 科技 / 平台 / 半導體
+    "0700": "騰訊控股",
+    "1810": "小米集團-W",
+    "3690": "美團-W",
+    "1024": "快手-W",
+    "0981": "中芯國際",
+    "3750": "寧德時代",
+    "9988": "阿里巴巴-W",
+
+    # 金融 / 交易所 / 地產
+    "0388": "香港交易所",
+    "2318": "中國平安",
+    "0005": "滙豐控股",
+    "1398": "工商銀行",
+    "3988": "中國銀行",
+    "0016": "新鴻基地產",
+
+    # 電信 / 能源
+    "0941": "中國移動",
+    "0762": "中國聯通",
+    "0883": "中國海洋石油",
+
+    # 汽車 / 製造 / 基礎設施
+    "1211": "比亞迪股份",
+    "0175": "吉利汽車",
+    "6869": "長飛光纖光纜",
+    "2899": "紫金礦業",
+
+    # 醫療 / 消費
+    "6618": "京東健康",
+    "1093": "石藥集團",
+    "0291": "華潤啤酒",
+    "9633": "農夫山泉",
+
+    # 旅遊 / 娛樂
+    "0027": "銀河娛樂",
 }
 
-HK_STOCK = [
-    "TENCENT","XIAOMI","MEITUAN","KUAISHOU","HKEX","SMIC",
-    "BYD","CATL","YOFC","ZIJINMINING",
-]
+# 相容既有函式命名
+HK_CORE_CODES = HK_FIXED_CODES
 
-HK_ALIASES = {
-    "TENCENT": ["TENCENT", "700", "0700"],
-    "XIAOMI": ["XIAOMI", "1810"],
-    "MEITUAN": ["MEITUAN", "3690"],
-    "KUAISHOU": ["KUAISHOU", "1024"],
-    "HKEX": ["HKEX", "0388", "388"],
-    "SMIC": ["SMIC", "0981", "981"],
-    "BYD": ["BYD", "1211"],
-    "CATL": ["CATL", "3750"],
-    "YOFC": ["YOFC", "6869"],
-    "ZIJINMINING": ["ZIJINMINING", "2899"],
-}
-
-HK_YAHOO = {
-    "TENCENT": "0700.HK",
-    "XIAOMI": "1810.HK",
-    "MEITUAN": "3690.HK",
-    "KUAISHOU": "1024.HK",
-    "HKEX": "0388.HK",
-    "SMIC": "0981.HK",
-    "BYD": "1211.HK",
-    "CATL": "3750.HK",
-    "YOFC": "6869.HK",
-    "ZIJINMINING": "2899.HK",
-}
+# 港股採固定池，不做每輪全市場海選。
+# 每輪只用 Gate 股票清單驗證這 25 檔是否仍可交易，再跑完整 1D + 1H + 15m。
+HK_FIXED_POOL_SIZE = len(HK_FIXED_CODES)
 
 ONE_H = 3600
 FIFTEEN_M = 15 * 60
@@ -353,122 +366,134 @@ def discover_contracts():
     return mapping
 
 
-def discover_hk_stock_symbols():
-    """Gate 股票區港股白名單。
+def hk_code(raw_symbol):
+    """把 Gate 港股 symbol 正規化成 Yahoo 常用代碼。"""
+    digits = re.sub(r"\D", "", str(raw_symbol or ""))
+    if not digits:
+        return None
+    stripped = digits.lstrip("0") or "0"
+    # 00700 / 700 -> 0700；09633 -> 9633。若真有 >4 位有效代碼則保留。
+    return stripped.zfill(4) if len(stripped) <= 4 else stripped
 
-    修正版：
-    - 明確指定 page_size=500，避免 API 預設只回第一小頁。
-    - 依 total_page 自動翻頁；若沒有 total_page，持續抓到空頁或不足 page_size。
-    - 只接受 exchange=hk 回傳的股票，不碰 USDT/PERP/FUTURES。
-    - 額外輸出總抓取數與成功對應數，方便 GitHub Actions 直接驗證。
+
+def hk_yahoo_symbol(code):
+    return f"{code}.HK" if code else None
+
+
+def localized_stock_name(item):
+    """優先取繁中/簡中名稱，沒有再退回 Gate symbol_desc / 固定中文表。"""
+    descs = item.get("symbol_descs") or []
+    preferred = ("zh-tw", "zh-hk", "zh-cn", "zh", "cn", "tw")
+    by_lang = {}
+    for d in descs:
+        if not isinstance(d, dict):
+            continue
+        lang = str(d.get("lang", "")).strip().lower().replace("_", "-")
+        value = str(d.get("value", "") or "").strip()
+        if lang and value:
+            by_lang[lang] = value
+    for p in preferred:
+        if p in by_lang:
+            return by_lang[p]
+    code = hk_code(item.get("symbol"))
+    if code in HK_CORE_CODES:
+        return HK_CORE_CODES[code]
+    return str(item.get("symbol_desc", "") or code or item.get("symbol", "")).strip()
+
+
+def discover_hk_stock_universe():
+    """載入 Gate 股票區完整香港股票 universe。
+
+    僅保留 asset_type=STOCK 的港股；ETF 不混進個股 2560。
+    不設價格上限。中文名稱直接保留在 metadata。
     """
+    all_items=[]
+    page=1
+    page_size=500
+    max_pages=50
+    while page <= max_pages:
+        payload=gate_get(
+            "/stock/symbols",
+            {
+                "exchange":"hk",
+                "with_desc_i18n":"true",
+                "page":page,
+                "page_size":page_size,
+            },
+        )
+        data=payload.get("data",{}) if isinstance(payload,dict) else {}
+        items=data.get("list",[]) if isinstance(data,dict) else []
+        if not items:
+            break
+        all_items.extend(items)
+        total_page=data.get("total_page", data.get("total_pages")) if isinstance(data,dict) else None
+        try:
+            total_page=int(total_page) if total_page is not None else None
+        except Exception:
+            total_page=None
+        if (total_page is not None and page>=total_page) or (total_page is None and len(items)<page_size):
+            break
+        page += 1
 
-    all_items = []
-    page = 1
-    page_size = 500
-    max_pages = 50
-
-    try:
-        while page <= max_pages:
-            payload = gate_get(
-                "/stock/symbols",
-                {
-                    "exchange": "hk",
-                    "with_desc_i18n": "false",
-                    "page": page,
-                    "page_size": page_size,
-                },
-            )
-
-            data = payload.get("data", {}) if isinstance(payload, dict) else {}
-            items = data.get("list", []) if isinstance(data, dict) else []
-
-            if not items:
-                break
-
-            all_items.extend(items)
-
-            total_page = None
-            if isinstance(data, dict):
-                total_page = data.get("total_page")
-                if total_page is None:
-                    total_page = data.get("total_pages")
-
-            try:
-                total_page = int(total_page) if total_page is not None else None
-            except (TypeError, ValueError):
-                total_page = None
-
-            if total_page is not None:
-                if page >= total_page:
-                    break
-            elif len(items) < page_size:
-                break
-
-            page += 1
-
-    except Exception as e:
-        print(f"HK STOCK WHITELIST ERROR: {e}")
-        return {symbol: None for symbol in HK_STOCK}
-
-    # 去重，避免翻頁或 API 排序造成重複。
-    available = {}
+    universe=[]
+    seen=set()
     for item in all_items:
-        raw = str(item.get("symbol", "") or "").strip()
-        if not raw:
+        if str(item.get("exchange", "hk")).lower() != "hk":
+            continue
+        if str(item.get("asset_type", "STOCK")).upper() != "STOCK":
+            continue
+        raw=str(item.get("symbol", "") or "").strip()
+        code=hk_code(raw)
+        if not raw or not code or code in seen:
+            continue
+        seen.add(code)
+        universe.append({
+            "code":code,
+            "gate_symbol":raw,
+            "yahoo_symbol":hk_yahoo_symbol(code),
+            "name_zh":localized_stock_name(item),
+            "symbol_desc":str(item.get("symbol_desc", "") or "").strip(),
+            "category":item.get("category"),
+            "trade_status":item.get("trade_status"),
+            "trade_mode":item.get("trade_mode"),
+        })
+
+    universe.sort(key=lambda x: x["code"])
+    print(f"HK FULL UNIVERSE LOADED: Gate rows={len(all_items)} stocks={len(universe)} pages={page}")
+    return universe
+
+
+def discover_hk_stock_symbols():
+    """相容舊介面：回傳 code -> Gate symbol。"""
+    return {x["code"]:x["gate_symbol"] for x in discover_hk_stock_universe()}
+
+
+def build_hk_fixed_pool(universe):
+    """只從固定 25 檔中建立本輪港股池，不做全市場 K 線海選。"""
+    by_code = {x["code"]: x for x in universe}
+
+    selected = []
+    missing = []
+
+    for code, fallback_name in HK_FIXED_CODES.items():
+        item = by_code.get(code)
+        if item is None:
+            missing.append(code)
             continue
 
-        raw_norm = norm(raw)
-        available.setdefault(raw_norm, raw)
+        selected.append({
+            **item,
+            "name_zh": item.get("name_zh") or fallback_name,
+        })
 
-        # 某些市場代號可能帶 HK / 股票所前後綴。
-        # 同時建立純數字索引，讓 700 / 0700 / 00700 都能互認。
-        digits = re.sub(r"\D", "", raw)
-        if digits:
-            available.setdefault(digits, raw)
-            available.setdefault(digits.lstrip("0") or "0", raw)
-            available.setdefault(digits.zfill(4), raw)
-            available.setdefault(digits.zfill(5), raw)
-
-    mapping = {}
-
-    for symbol in HK_STOCK:
-        found = None
-
-        for cand in HK_ALIASES.get(symbol, [symbol]):
-            keys = []
-            cand_norm = norm(cand)
-            if cand_norm:
-                keys.append(cand_norm)
-
-            digits = re.sub(r"\D", "", str(cand))
-            if digits:
-                keys.extend([
-                    digits,
-                    digits.lstrip("0") or "0",
-                    digits.zfill(4),
-                    digits.zfill(5),
-                ])
-
-            for key in dict.fromkeys(keys):
-                if key in available:
-                    found = available[key]
-                    break
-
-            if found:
-                break
-
-        # Gate 股票白名單與 Yahoo 港股現貨代號都必須存在才啟用。
-        mapping[symbol] = found if (found and HK_YAHOO.get(symbol)) else None
-
-    matched = sum(1 for v in mapping.values() if v)
     print(
-        f"HK STOCK WHITELIST LOADED: rows={len(all_items)} "
-        f"matched={matched}/{len(HK_STOCK)} pages={page}"
+        f"HK FIXED POOL: configured={len(HK_FIXED_CODES)} "
+        f"available={len(selected)} missing={len(missing)}"
     )
+    if missing:
+        print("HK FIXED POOL MISSING:", ", ".join(missing))
 
-    return mapping
-
+    return selected
 
 YAHOO_HOSTS = [
     "https://query1.finance.yahoo.com",
@@ -507,27 +532,13 @@ def yahoo_get(symbol, interval, range_text, retries=4):
     raise RuntimeError(f"Yahoo request failed: {last}")
 
 
-def fetch_hk_stock(base_symbol, interval):
-    y = HK_YAHOO.get(base_symbol)
-    if not y:
-        raise RuntimeError(f"HK Yahoo symbol missing: {base_symbol}")
-
-    if interval == "1d":
-        yi, yr = "1d", "2y"
-    elif interval == "1h":
-        yi, yr = "60m", "3mo"
-    elif interval == "15m":
-        yi, yr = "15m", "60d"
-    else:
-        raise RuntimeError(f"unsupported HK interval: {interval}")
-
-    data = yahoo_get(y, yi, yr)
+def parse_yahoo_rows(data):
     ts = data.get("timestamp") or []
     q = (data.get("indicators", {}).get("quote") or [{}])[0]
     opens=q.get("open") or []; highs=q.get("high") or []; lows=q.get("low") or []
     closes=q.get("close") or []; vols=q.get("volume") or []
     rows=[]
-    for i,t in enumerate(ts):
+    for i,tstamp in enumerate(ts):
         try:
             o,h,l,c=opens[i],highs[i],lows[i],closes[i]
             v=vols[i] if i < len(vols) else 0
@@ -535,9 +546,109 @@ def fetch_hk_stock(base_symbol, interval):
             continue
         if None in (o,h,l,c):
             continue
-        rows.append({"t":int(t),"o":float(o),"h":float(h),"l":float(l),"c":float(c),"v":float(v or 0)})
+        rows.append({
+            "t":int(tstamp),
+            "o":float(o),
+            "h":float(h),
+            "l":float(l),
+            "c":float(c),
+            "v":float(v or 0),
+        })
     rows.sort(key=lambda z:z["t"])
     return rows
+
+
+def fetch_hk_stock(code, interval):
+    y=hk_yahoo_symbol(code)
+    if not y:
+        raise RuntimeError(f"HK Yahoo symbol missing: {code}")
+    if interval == "1d":
+        yi,yr="1d","2y"
+    elif interval == "1h":
+        yi,yr="60m","3mo"
+    elif interval == "15m":
+        yi,yr="15m","60d"
+    else:
+        raise RuntimeError(f"unsupported HK interval: {interval}")
+    return parse_yahoo_rows(yahoo_get(y,yi,yr))
+
+
+def hk_daily_prefilter(stock):
+    """固定池舊版篩選（目前未使用）：只抓日K，先檢查流動性/波動/歷史。
+
+    價格不設上限；核心股即使未達量能/波動門檻也保留進第二段。
+    """
+    code=stock["code"]
+    rows=fetch_hk_stock(code,"1d")
+    if len(rows) < HK_MIN_DAILY_BARS:
+        return {**stock,"prefilter_pass":False,"prefilter_reason":"history","daily_bars":len(rows)}
+
+    add_ind(rows,ONE_D)
+    last=rows[-1]
+    recent20=rows[-20:]
+    avg_turnover=sum(abs(x["c"]*x.get("v",0)) for x in recent20)/max(1,len(recent20))
+    atr14=last.get("atr14")
+    atr_pct=(atr14/last["c"]*100.0) if atr14 and last.get("c") else 0.0
+    hi=max(x["h"] for x in recent20)
+    lo=min(x["l"] for x in recent20)
+    range20_pct=((hi/lo)-1.0)*100.0 if lo>0 else 0.0
+    trend_ok=hk_daily_strategy_ok(last)
+    is_core=code in HK_CORE_CODES
+
+    passed=(
+        is_core or (
+            avg_turnover >= HK_MIN_AVG_TURNOVER_20D
+            and atr_pct >= HK_MIN_ATR_PCT
+            and range20_pct >= HK_MIN_RANGE20_PCT
+        )
+    )
+
+    # 分數只用來控制第二段掃描數量，不是交易評分或買賣排名。
+    liquidity_score=max(0.0, math.log10(max(avg_turnover,1.0))-6.0)
+    score=(liquidity_score*1.5)+(atr_pct*1.2)+(range20_pct*0.10)+(1.0 if trend_ok else 0.0)+(3.0 if is_core else 0.0)
+    return {
+        **stock,
+        "prefilter_pass":passed,
+        "prefilter_reason":"PASS" if passed else "liquidity_or_volatility",
+        "daily_bars":len(rows),
+        "last_price":last["c"],
+        "avg_turnover_20d":avg_turnover,
+        "atr_pct":atr_pct,
+        "range20_pct":range20_pct,
+        "daily_strategy":trend_ok,
+        "prefilter_score":score,
+    }
+
+
+def build_hk_candidate_pool(universe):
+    """舊版全市場候選池函式，目前固定池模式不呼叫。"""
+    scanned=[]
+    with ThreadPoolExecutor(max_workers=HK_SCAN_WORKERS) as ex:
+        futs={ex.submit(hk_daily_prefilter,s):s for s in universe}
+        for fut in as_completed(futs):
+            s=futs[fut]
+            try:
+                scanned.append(fut.result())
+            except Exception as e:
+                scanned.append({**s,"prefilter_pass":False,"prefilter_reason":f"ERROR:{e}"})
+
+    passed=[x for x in scanned if x.get("prefilter_pass")]
+    passed.sort(key=lambda x:(x.get("prefilter_score",0.0),x.get("avg_turnover_20d",0.0)), reverse=True)
+
+    core=[x for x in passed if x["code"] in HK_CORE_CODES]
+    noncore=[x for x in passed if x["code"] not in HK_CORE_CODES]
+    slots=max(0,HK_SCAN_MAX_CANDIDATES-len(core))
+    selected=core+noncore[:slots]
+    # 若核心股數本身已超上限，仍全部保留。
+    selected.sort(key=lambda x:(x["code"] not in HK_CORE_CODES,-x.get("prefilter_score",0.0)))
+
+    print(
+        f"HK PREFILTER: universe={len(universe)} pass={len(passed)} "
+        f"selected={len(selected)} core={len(core)} "
+        f"minTurnover={HK_MIN_AVG_TURNOVER_20D:,.0f}HKD "
+        f"minATR={HK_MIN_ATR_PCT:.2f}% minRange20={HK_MIN_RANGE20_PCT:.2f}% priceCap=NONE"
+    )
+    return selected, scanned
 
 
 def fetch(contract, interval, limit):
@@ -846,7 +957,7 @@ def hk_target_zone(rd, r1, current):
     }
 
 
-def analyze_hk_stock(base_symbol, gate_stock_symbol):
+def analyze_hk_stock(base_symbol, gate_stock_symbol, name_zh=None):
     now=int(datetime.now(timezone.utc).timestamp())
     rd=completed_only(fetch_hk_stock(base_symbol,"1d"), ONE_D, now)
     r1=completed_only(fetch_hk_stock(base_symbol,"1h"), ONE_H, now)
@@ -855,6 +966,8 @@ def analyze_hk_stock(base_symbol, gate_stock_symbol):
     if len(rd)<65 or len(r1)<65 or len(r15)<65:
         return {
             "base":base_symbol,
+            "name_zh":name_zh or HK_CORE_CODES.get(base_symbol, base_symbol),
+            "display":f"{base_symbol} {name_zh or HK_CORE_CODES.get(base_symbol, base_symbol)}",
             "contract":gate_stock_symbol,
             "market_type":"HK_STOCK",
             "group":"HK_STOCK",
@@ -884,6 +997,8 @@ def analyze_hk_stock(base_symbol, gate_stock_symbol):
     target=hk_target_zone(rd,r1,m["c"])
     return {
         "base":base_symbol,
+        "name_zh":name_zh or HK_CORE_CODES.get(base_symbol, base_symbol),
+        "display":f"{base_symbol} {name_zh or HK_CORE_CODES.get(base_symbol, base_symbol)}",
         "contract":gate_stock_symbol,
         "market_type":"HK_STOCK",
         "group":"HK_STOCK",
@@ -1484,6 +1599,10 @@ def analyze(base_symbol, contract):
     }
 
 
+def signal_label(r):
+    return r.get("display") or r.get("base") or "UNKNOWN"
+
+
 # ============================================================
 # Notifications
 # ============================================================
@@ -1613,8 +1732,8 @@ def format_signal_detail(r):
 
 def notify_early_signal(r):
     send_ntfy(
-        f"2560 {r.get('status')} {r['base']}",
-        f"{r['base']} 2560 訊號\n\n{format_signal_detail(r)}",
+        f"2560 {r.get('status')} {signal_label(r)}",
+        f"{signal_label(r)} 2560 訊號\n\n{format_signal_detail(r)}",
         "default",
         "chart_with_upwards_trend",
     )
@@ -1623,7 +1742,7 @@ def notify_early_signal(r):
 def notify_pre_strict(r):
     g = r.get("grid")
     msg = (
-        f"{r['base']} 2560 PRE-STRICT\n\n"
+        f"{signal_label(r)} 2560 PRE-STRICT\n\n"
         f"定位：第一段可開網候選\n"
         f"現價：{price_text(r.get('latest_close'))}\n"
         f"4H結構：{r.get('4h_structure', 'N/A')}\n"
@@ -1640,7 +1759,7 @@ def notify_pre_strict(r):
         f"原則：寧可寬一點、少成交幾格，也不要下沿太貼現價。"
     )
     send_ntfy(
-        f"2560 PRE-STRICT {r['base']}",
+        f"2560 PRE-STRICT {signal_label(r)}",
         msg,
         "high",
         "chart_with_upwards_trend,bell",
@@ -1669,7 +1788,7 @@ def notify_strict(r, symbol_state):
         )
 
     msg = (
-        f"{r['base']} 2560 STRICT\n\n"
+        f"{signal_label(r)} 2560 STRICT\n\n"
         f"定位：趨勢確認 / 第二網審核點\n"
         f"現價：{price_text(r.get('latest_close'))}\n"
         f"PRE-STRICT價：{price_text(pre_price)}\n"
@@ -1681,7 +1800,7 @@ def notify_strict(r, symbol_state):
         f"{('Gate港股股票區：STRICT=日K/1H/15m趨勢確認，只做現股候選。' if r.get('market_type') == 'HK_STOCK' else format_grid(g))}"
     )
     send_ntfy(
-        f"2560 STRICT {r['base']}",
+        f"2560 STRICT {signal_label(r)}",
         msg,
         "high",
         "chart_with_upwards_trend,bell",
@@ -1722,7 +1841,7 @@ def notify_status_change(r, state):
 # ============================================================
 
 def main():
-    print("2560 Cloud Monitor | FINAL 2026-09-28 SIGNAL DETAIL")
+    print("2560 Cloud Monitor | FINAL 2026-09-28 HK FIXED POOL")
     print("UTC:", now_iso())
     print(
         "Rule: NO_SIGNAL -> WATCH -> TREND_READY -> "
@@ -1735,15 +1854,18 @@ def main():
 
     state = load_state()
     contract_map = discover_contracts()
-    hk_stock_map = discover_hk_stock_symbols()
+    hk_universe = discover_hk_stock_universe()
+    hk_candidates = build_hk_fixed_pool(hk_universe)
 
     print("\nCONTRACT MAP")
     for base in REQUESTED:
         print(f"{base:<12} -> {contract_map.get(base)}")
 
-    print("\nGATE HK STOCK MAP")
-    for base in HK_STOCK:
-        print(f"{base:<12} -> {hk_stock_map.get(base)}")
+    print("\nGATE HK FIXED POOL")
+    for s in hk_candidates:
+        print(
+            f"{s['code']:<6} {s.get('name_zh',''):<18} -> {s.get('gate_symbol')}"
+        )
 
     results = []
     errors = []
@@ -1829,51 +1951,45 @@ def main():
 
         time.sleep(0.15)
 
-    print("\nSCAN HK STOCK 2560")
-    for base in HK_STOCK:
-        gate_symbol = hk_stock_map.get(base)
-        if not gate_symbol:
-            print(f"{base:<12} NOT_FOUND_IN_GATE_STOCK")
-            results.append({"base":base,"group":"HK_STOCK","status":"NOT_FOUND"})
-            continue
+    print("\nSCAN HK STOCK 2560 | FIXED 25-STOCK POOL")
+    for s in hk_candidates:
+        base=s["code"]
+        gate_symbol=s["gate_symbol"]
+        name_zh=s.get("name_zh") or HK_CORE_CODES.get(base,base)
+        label=f"{base} {name_zh}"
         try:
-            r=analyze_hk_stock(base,gate_symbol)
+            r=analyze_hk_stock(base,gate_symbol,name_zh)
             results.append(r)
             if r.get("status") == "WAIT_HISTORY":
-                print(f"{base:<12} WAIT_HISTORY 1D={r.get('history_1d_bars')} 1H={r.get('history_1h_bars')} 15m={r.get('history_15m_bars')}")
+                print(f"{label:<28} WAIT_HISTORY 1D={r.get('history_1d_bars')} 1H={r.get('history_1h_bars')} 15m={r.get('history_15m_bars')}")
+            elif r["status"] == "NO_SIGNAL":
+                print(f"{label:<28} NO_SIGNAL close={price_text(r.get('latest_close'))}")
             else:
-                if r["status"] == "NO_SIGNAL":
-                    print(
-                        f"{base:<12} NO_SIGNAL    "
-                        f"close={price_text(r.get('latest_close'))}"
-                    )
-                else:
-                    t = r.get("expected_target") or {}
-                    print(
-                        f"{base:<12} {r['status']:<12} "
-                        f"now={price_text(r.get('latest_close'))} "
-                        f"target={price_text(t.get('target_base'))}"
-                        f"~{price_text(t.get('target_high'))} "
-                        f"space={pct_text(t.get('expected_base_pct'))}"
-                        f"~{pct_text(t.get('expected_high_pct'))} "
-                        f"support={price_text(t.get('nearest_support'))} "
-                        f"resist={price_text(t.get('nearest_resistance'))} "
-                        f"1D={r.get('1d_strategy')} "
-                        f"1H={r.get('1h_wave')} "
-                        f"15m={r.get('15m_entry')}"
-                    )
+                tg=r.get("expected_target") or {}
+                print(
+                    f"{label:<28} {r['status']:<12} "
+                    f"now={price_text(r.get('latest_close'))} "
+                    f"target={price_text(tg.get('target_base'))}~{price_text(tg.get('target_high'))} "
+                    f"space={pct_text(tg.get('expected_base_pct'))}~{pct_text(tg.get('expected_high_pct'))} "
+                    f"support={price_text(tg.get('nearest_support'))} "
+                    f"resist={price_text(tg.get('nearest_resistance'))} "
+                    f"1D={r.get('1d_strategy')} 1H={r.get('1h_wave')} 15m={r.get('15m_entry')}"
+                )
             notify_status_change(r,state)
         except Exception as e:
-            errors.append((base,str(e)))
-            print(f"{base:<12} ERROR {e}")
-            results.append({"base":base,"group":"HK_STOCK","status":"ERROR","error":str(e)})
-        time.sleep(0.15)
+            errors.append((label,str(e)))
+            print(f"{label:<28} ERROR {e}")
+            results.append({"base":base,"name_zh":name_zh,"display":label,"group":"HK_STOCK","status":"ERROR","error":str(e)})
+        time.sleep(0.10)
 
     RESULT_FILE.write_text(
         json.dumps(
             {
                 "generated_utc": now_iso(),
-                "rule_version": "2560_FINAL_2026_09_28_SIGNAL_DETAIL",
+                "rule_version": "2560_FINAL_2026_09_28_HK_FIXED_POOL",
+                "hk_gate_universe_count": len(hk_universe),
+                "hk_fixed_pool_configured": len(HK_FIXED_CODES),
+                "hk_fixed_pool_available": len(hk_candidates),
                 "results": results,
             },
             ensure_ascii=False,
