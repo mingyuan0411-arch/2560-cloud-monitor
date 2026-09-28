@@ -57,9 +57,10 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
+from datetime import datetime, timezone, time as dt_time
 from pathlib import Path
 from email.header import Header
+from zoneinfo import ZoneInfo
 
 BASE = "https://api.gateio.ws/api/v4"
 
@@ -126,6 +127,110 @@ HK_CORE_CODES = HK_FIXED_CODES
 # 港股採固定池，不做每輪全市場海選。
 # 每輪只用 Gate 股票清單驗證這 25 檔是否仍可交易，再跑完整 1D + 1H + 15m。
 HK_FIXED_POOL_SIZE = len(HK_FIXED_CODES)
+
+# 港股 2560 智慧掃描：
+# - 盤中：每個新的 15m 時間桶只掃一次
+# - 午休 / 收盤後 / 凌晨：不重複掃描
+# - 16:10~16:40：每天強制做一次完整收盤確認
+HK_TZ = ZoneInfo("Asia/Hong_Kong")
+HK_AM_START = dt_time(9, 30)
+HK_AM_END = dt_time(12, 0)
+HK_PM_START = dt_time(13, 0)
+HK_PM_END = dt_time(16, 0)
+HK_CLOSE_CONFIRM_START = dt_time(16, 10)
+HK_CLOSE_CONFIRM_END = dt_time(16, 40)
+
+
+def hk_now():
+    return datetime.now(timezone.utc).astimezone(HK_TZ)
+
+
+def hk_intraday_bucket(now_hk=None):
+    """回傳目前所屬 15m bucket，例如 2026-09-28 10:45。非交易時段回 None。"""
+    now_hk = now_hk or hk_now()
+
+    if now_hk.weekday() >= 5:
+        return None
+
+    t = now_hk.time().replace(tzinfo=None)
+    in_session = (
+        HK_AM_START <= t < HK_AM_END
+        or HK_PM_START <= t < HK_PM_END
+    )
+    if not in_session:
+        return None
+
+    minute = (now_hk.minute // 15) * 15
+    bucket = now_hk.replace(minute=minute, second=0, microsecond=0)
+    return bucket.strftime("%Y-%m-%d %H:%M")
+
+
+def hk_scan_decision(state, now_hk=None):
+    """
+    決定本輪是否需要重新掃港股。
+    回傳 (should_scan, reason, token)
+    reason:
+      INTRADAY_NEW_15M
+      CLOSE_CONFIRM
+      SKIP_SAME_15M
+      SKIP_LUNCH
+      SKIP_OFF_HOURS
+      SKIP_WEEKEND
+      SKIP_WAIT_CLOSE_CONFIRM
+    """
+    now_hk = now_hk or hk_now()
+    meta = state.setdefault("hk_scan_meta", {})
+    date_key = now_hk.date().isoformat()
+
+    if now_hk.weekday() >= 5:
+        return False, "SKIP_WEEKEND", None
+
+    t = now_hk.time().replace(tzinfo=None)
+
+    bucket = hk_intraday_bucket(now_hk)
+    if bucket is not None:
+        if meta.get("last_intraday_bucket") == bucket:
+            return False, "SKIP_SAME_15M", bucket
+        return True, "INTRADAY_NEW_15M", bucket
+
+    if HK_CLOSE_CONFIRM_START <= t < HK_CLOSE_CONFIRM_END:
+        if meta.get("last_close_confirm_date") == date_key:
+            return False, "SKIP_CLOSE_ALREADY_DONE", date_key
+        return True, "CLOSE_CONFIRM", date_key
+
+    if HK_AM_END <= t < HK_PM_START:
+        return False, "SKIP_LUNCH", None
+
+    if HK_PM_END <= t < HK_CLOSE_CONFIRM_START:
+        return False, "SKIP_WAIT_CLOSE_CONFIRM", None
+
+    return False, "SKIP_OFF_HOURS", None
+
+
+def mark_hk_scan_done(state, reason, token):
+    meta = state.setdefault("hk_scan_meta", {})
+    if reason == "INTRADAY_NEW_15M":
+        meta["last_intraday_bucket"] = token
+    elif reason == "CLOSE_CONFIRM":
+        meta["last_close_confirm_date"] = token
+    meta["last_scan_reason"] = reason
+    meta["last_scan_utc"] = now_iso()
+
+
+def load_previous_hk_results():
+    """非掃描時段沿用上一輪港股結果，避免結果檔被清空。"""
+    if not RESULT_FILE.exists():
+        return []
+
+    try:
+        payload = json.loads(RESULT_FILE.read_text(encoding="utf-8"))
+        return [
+            r for r in payload.get("results", [])
+            if r.get("group") == "HK_STOCK"
+        ]
+    except Exception as e:
+        print("HK PREVIOUS RESULT WARN:", e)
+        return []
 
 ONE_H = 3600
 FIFTEEN_M = 15 * 60
@@ -1854,7 +1959,7 @@ def notify_status_change(r, state):
 # ============================================================
 
 def main():
-    print("2560 Cloud Monitor | FINAL 2026-09-28 HK FIXED POOL UTF8")
+    print("2560 Cloud Monitor | FINAL 2026-09-28 HK SMART SCAN")
     print("UTC:", now_iso())
     print(
         "Rule: NO_SIGNAL -> WATCH -> TREND_READY -> "
@@ -1867,18 +1972,35 @@ def main():
 
     state = load_state()
     contract_map = discover_contracts()
-    hk_universe = discover_hk_stock_universe()
-    hk_candidates = build_hk_fixed_pool(hk_universe)
+
+    hk_should_scan, hk_scan_reason, hk_scan_token = hk_scan_decision(state)
+    hk_universe = []
+    hk_candidates = []
+
+    print(
+        "HK SMART SCAN:",
+        f"local={hk_now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"scan={hk_should_scan}",
+        f"reason={hk_scan_reason}",
+        f"token={hk_scan_token}",
+    )
+
+    if hk_should_scan:
+        hk_universe = discover_hk_stock_universe()
+        hk_candidates = build_hk_fixed_pool(hk_universe)
 
     print("\nCONTRACT MAP")
     for base in REQUESTED:
         print(f"{base:<12} -> {contract_map.get(base)}")
 
-    print("\nGATE HK FIXED POOL")
-    for s in hk_candidates:
-        print(
-            f"{s['code']:<6} {s.get('name_zh',''):<18} -> {s.get('gate_symbol')}"
-        )
+    if hk_should_scan:
+        print("\nGATE HK FIXED POOL")
+        for s in hk_candidates:
+            print(
+                f"{s['code']:<6} {s.get('name_zh',''):<18} -> {s.get('gate_symbol')}"
+            )
+    else:
+        print("\nGATE HK FIXED POOL: reuse previous results; no market-data rescan this run")
 
     results = []
     errors = []
@@ -1965,44 +2087,96 @@ def main():
         time.sleep(0.15)
 
     print("\nSCAN HK STOCK 2560 | FIXED 25-STOCK POOL")
-    for s in hk_candidates:
-        base=s["code"]
-        gate_symbol=s["gate_symbol"]
-        name_zh=s.get("name_zh") or HK_CORE_CODES.get(base,base)
-        label=f"{base} {name_zh}"
-        try:
-            r=analyze_hk_stock(base,gate_symbol,name_zh)
-            results.append(r)
-            if r.get("status") == "WAIT_HISTORY":
-                print(f"{label:<28} WAIT_HISTORY 1D={r.get('history_1d_bars')} 1H={r.get('history_1h_bars')} 15m={r.get('history_15m_bars')}")
-            elif r["status"] == "NO_SIGNAL":
-                print(f"{label:<28} NO_SIGNAL close={price_text(r.get('latest_close'))}")
-            else:
-                tg=r.get("expected_target") or {}
-                print(
-                    f"{label:<28} {r['status']:<12} "
-                    f"now={price_text(r.get('latest_close'))} "
-                    f"target={price_text(tg.get('target_base'))}~{price_text(tg.get('target_high'))} "
-                    f"space={pct_text(tg.get('expected_base_pct'))}~{pct_text(tg.get('expected_high_pct'))} "
-                    f"support={price_text(tg.get('nearest_support'))} "
-                    f"resist={price_text(tg.get('nearest_resistance'))} "
-                    f"1D={r.get('1d_strategy')} 1H={r.get('1h_wave')} 15m={r.get('15m_entry')}"
-                )
-            notify_status_change(r,state)
-        except Exception as e:
-            errors.append((label,str(e)))
-            print(f"{label:<28} ERROR {e}")
-            results.append({"base":base,"name_zh":name_zh,"display":label,"group":"HK_STOCK","status":"ERROR","error":str(e)})
-        time.sleep(0.10)
+
+    if hk_should_scan:
+        hk_scan_had_error = False
+
+        for s in hk_candidates:
+            base=s["code"]
+            gate_symbol=s["gate_symbol"]
+            name_zh=s.get("name_zh") or HK_CORE_CODES.get(base,base)
+            label=f"{base} {name_zh}"
+
+            try:
+                r=analyze_hk_stock(base,gate_symbol,name_zh)
+                results.append(r)
+
+                if r.get("status") == "WAIT_HISTORY":
+                    print(
+                        f"{label:<28} WAIT_HISTORY "
+                        f"1D={r.get('history_1d_bars')} "
+                        f"1H={r.get('history_1h_bars')} "
+                        f"15m={r.get('history_15m_bars')}"
+                    )
+                elif r["status"] == "NO_SIGNAL":
+                    print(
+                        f"{label:<28} NO_SIGNAL "
+                        f"close={price_text(r.get('latest_close'))}"
+                    )
+                else:
+                    tg=r.get("expected_target") or {}
+                    print(
+                        f"{label:<28} {r['status']:<12} "
+                        f"now={price_text(r.get('latest_close'))} "
+                        f"target={price_text(tg.get('target_base'))}"
+                        f"~{price_text(tg.get('target_high'))} "
+                        f"space={pct_text(tg.get('expected_base_pct'))}"
+                        f"~{pct_text(tg.get('expected_high_pct'))} "
+                        f"support={price_text(tg.get('nearest_support'))} "
+                        f"resist={price_text(tg.get('nearest_resistance'))} "
+                        f"1D={r.get('1d_strategy')} "
+                        f"1H={r.get('1h_wave')} "
+                        f"15m={r.get('15m_entry')}"
+                    )
+
+                notify_status_change(r,state)
+
+            except Exception as e:
+                hk_scan_had_error = True
+                errors.append((label,str(e)))
+                print(f"{label:<28} ERROR {e}")
+                results.append({
+                    "base":base,
+                    "name_zh":name_zh,
+                    "display":label,
+                    "group":"HK_STOCK",
+                    "status":"ERROR",
+                    "error":str(e),
+                })
+
+            time.sleep(0.10)
+
+        # 只有整輪真正跑完才記錄時間桶。
+        # 個別股票錯誤仍保留，但不阻止下個 15m bucket 繼續掃。
+        mark_hk_scan_done(state, hk_scan_reason, hk_scan_token)
+
+        print(
+            "HK SCAN COMPLETE:",
+            f"reason={hk_scan_reason}",
+            f"token={hk_scan_token}",
+            f"symbols={len(hk_candidates)}"
+        )
+
+    else:
+        previous_hk = load_previous_hk_results()
+        results.extend(previous_hk)
+        print(
+            "HK SCAN SKIPPED:",
+            hk_scan_reason,
+            f"| reused_results={len(previous_hk)}"
+        )
 
     RESULT_FILE.write_text(
         json.dumps(
             {
                 "generated_utc": now_iso(),
-                "rule_version": "2560_FINAL_2026_09_28_HK_FIXED_POOL_UTF8",
-                "hk_gate_universe_count": len(hk_universe),
+                "rule_version": "2560_FINAL_2026_09_28_HK_SMART_SCAN",
+                "hk_scan_reason": hk_scan_reason,
+                "hk_scan_token": hk_scan_token,
+                "hk_rescanned_this_run": hk_should_scan,
+                "hk_gate_universe_count": len(hk_universe) if hk_should_scan else None,
                 "hk_fixed_pool_configured": len(HK_FIXED_CODES),
-                "hk_fixed_pool_available": len(hk_candidates),
+                "hk_fixed_pool_available": len(hk_candidates) if hk_should_scan else None,
                 "results": results,
             },
             ensure_ascii=False,
