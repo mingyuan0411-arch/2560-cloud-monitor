@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-2560 Cloud Monitor FINAL 2026-09-28 — Signal Detail Output
+2560 Cloud Monitor TARGET-FIRST FINAL 2026-09-28 — Signal Detail Output
 ===================================================
 
 用途
@@ -1111,7 +1111,9 @@ def analyze_hk_stock(base_symbol, gate_stock_symbol, name_zh=None):
     else:
         status="NO_SIGNAL"
 
+    # 港股同樣先估目標，不因狀態尚未升級而顯示 N/A。
     target=hk_target_zone(rd,r1,m["c"])
+    target=ensure_target_zone(target,m["c"],r1)
     return {
         "base":base_symbol,
         "name_zh":name_zh or HK_CORE_CODES.get(base_symbol, base_symbol),
@@ -1574,6 +1576,38 @@ def expected_target_zone(r4, rd, current):
         "atr_pct":atr_pct,
     }
 
+
+def ensure_target_zone(target_zone, current, r4):
+    """
+    候選訊號先有目標，再判斷狀態。
+    N/A 只允許代表資料真的不足，不可拿來當作「空間不足」。
+    """
+    z = dict(target_zone or {})
+    if current is None or current <= 0:
+        return z
+
+    atr = None
+    if r4:
+        atr = r4[-1].get("atr14")
+
+    fallback_step = atr if (atr is not None and atr > 0) else current * 0.02
+    fallback_base = current + fallback_step * 1.5
+    fallback_high = current + fallback_step * 2.5
+
+    if z.get("target_base") is None:
+        z["target_base"] = fallback_base
+        z["target_low"] = fallback_base
+    if z.get("target_high") is None:
+        z["target_high"] = max(z["target_base"], fallback_high)
+
+    if z.get("expected_base_pct") is None:
+        z["expected_base_pct"] = pct_change(current, z["target_base"])
+    if z.get("expected_high_pct") is None:
+        z["expected_high_pct"] = pct_change(current, z["target_high"])
+
+    return z
+
+
 # ============================================================
 # Analysis
 # ============================================================
@@ -1657,7 +1691,17 @@ def analyze(base_symbol, contract):
     if status in ("PRE-STRICT", "STRICT") and not timing_ok:
         status = "TREND_READY"
 
-    target_zone = expected_target_zone(r4, rd if history_mode != "4H_PROXY" else [], latest["c"])
+    # 先估目標，再決定是否可執行 PRE-STRICT / STRICT。
+    # WATCH / TREND_READY 也必須有合理目標區。
+    target_zone = ensure_target_zone(
+        expected_target_zone(
+            r4,
+            rd if history_mode != "4H_PROXY" else [],
+            latest["c"],
+        ),
+        latest["c"],
+        r4,
+    )
 
     grid = None
     if status == "PRE-STRICT":
