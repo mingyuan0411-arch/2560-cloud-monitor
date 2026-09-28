@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-2560 Cloud Monitor FINAL 2026-09-28R2 — Multi-Timeframe + HK Stock + Target
+2560 Cloud Monitor FINAL 2026-09-28 — Signal Detail Output
 ===================================================
 
 用途
@@ -834,6 +834,14 @@ def hk_target_zone(rd, r1, current):
         "expected_high_pct":pct_change(current,high),
         "nearest_resistance":near,
         "major_resistance":major,
+        "nearest_support": max(
+            [x["l"] for x in (r1[-90:] + rd[-120:]) if x.get("l") is not None and x["l"] < current],
+            default=None,
+        ),
+        "major_support": min(
+            [x["l"] for x in (r1[-90:] + rd[-120:]) if x.get("l") is not None and x["l"] < current],
+            default=None,
+        ),
         "atr_pct":atr_pct,
     }
 
@@ -1276,14 +1284,27 @@ def longlife_grid_plan(base_symbol, r4, current_price, capital_pct):
 # Multi-timeframe timing + expected target
 # ============================================================
 
-def lower_entry_timing(r1, r15):
+def lower_entry_flags(r1, r15):
     """1D=戰略、4H=波段；1H/15m只負責進場，不要求全週期均線同向。"""
     need1=[r1.get("ma5"),r1.get("ma10"),r1.get("ma20"),r1.get("ma20_prev")]
     need15=[r15.get("ma5"),r15.get("ma10"),r15.get("ma20")]
-    if any(x is None for x in need1+need15): return False
-    h1=(r1["c"] >= r1["ma20"]*0.990 and r1["ma20"] >= r1["ma20_prev"]*0.995 and r1["ma5"] >= r1["ma10"]*0.985)
-    m15=(r15["c"] >= r15["ma20"]*0.992 and r15["ma5"] >= r15["ma10"]*0.985)
-    return h1 and m15
+    if any(x is None for x in need1+need15):
+        return {"1h_entry": False, "15m_entry": False, "timing_ok": False}
+
+    h1=(
+        r1["c"] >= r1["ma20"]*0.990
+        and r1["ma20"] >= r1["ma20_prev"]*0.995
+        and r1["ma5"] >= r1["ma10"]*0.985
+    )
+    m15=(
+        r15["c"] >= r15["ma20"]*0.992
+        and r15["ma5"] >= r15["ma10"]*0.985
+    )
+    return {"1h_entry": h1, "15m_entry": m15, "timing_ok": h1 and m15}
+
+
+def lower_entry_timing(r1, r15):
+    return lower_entry_flags(r1, r15)["timing_ok"]
 
 def expected_target_zone(r4, rd, current):
     """非固定百分比：綜合4H ATR、4H/1D前高與上級趨勢估合理目標區。"""
@@ -1301,7 +1322,25 @@ def expected_target_zone(r4, rd, current):
     # 防止單一歷史尖峰把目標拉到天邊，但不是用固定%產生目標，只作異常值護欄。
     high=min(high,current*1.20)
     base=min(base,high)
-    return {"target_low":base,"target_base":base,"target_high":high,"expected_base_pct":pct_change(current,base),"expected_high_pct":pct_change(current,high),"nearest_resistance":resistance,"major_resistance":major,"atr_pct":atr_pct}
+    support_candidates = [
+        x["l"] for x in (r4[-90:] + (rd[-90:] if rd else []))
+        if x.get("l") is not None and x["l"] < current
+    ]
+    nearest_support = max(support_candidates) if support_candidates else None
+    major_support = min(support_candidates) if support_candidates else None
+
+    return {
+        "target_low":base,
+        "target_base":base,
+        "target_high":high,
+        "expected_base_pct":pct_change(current,base),
+        "expected_high_pct":pct_change(current,high),
+        "nearest_resistance":resistance,
+        "major_resistance":major,
+        "nearest_support":nearest_support,
+        "major_support":major_support,
+        "atr_pct":atr_pct,
+    }
 
 # ============================================================
 # Analysis
@@ -1380,7 +1419,8 @@ def analyze(base_symbol, contract):
         history_mode,
     )
 
-    timing_ok = lower_entry_timing(r1[-1], r15[-1])
+    timing_flags = lower_entry_flags(r1[-1], r15[-1])
+    timing_ok = timing_flags["timing_ok"]
     # 上級方向成立但下級尚未到進場窗口時，不硬砍趨勢，只降回 TREND_READY/WATCH。
     if status in ("PRE-STRICT", "STRICT") and not timing_ok:
         status = "TREND_READY"
@@ -1436,6 +1476,8 @@ def analyze(base_symbol, contract):
         "1d_confirm": dconfirm,
         "strict_raw": raw_now,
         "strict": strict_now,
+        "1h_entry": timing_flags["1h_entry"],
+        "15m_entry": timing_flags["15m_entry"],
         "lower_entry_timing": timing_ok,
         "expected_target": target_zone,
         "grid": grid,
@@ -1531,8 +1573,52 @@ def format_target(t):
         f"合理目標上緣：{price_text(t.get('target_high'))} ({pct_text(t.get('expected_high_pct'))})\n"
         f"最近壓力：{price_text(t.get('nearest_resistance'))}\n"
         f"主要壓力：{price_text(t.get('major_resistance'))}\n"
-        f"4H ATR：{pct_text(t.get('atr_pct'))}"
+        f"最近支撐：{price_text(t.get('nearest_support'))}\n"
+        f"主要支撐：{price_text(t.get('major_support'))}\n"
+        f"ATR：{pct_text(t.get('atr_pct'))}"
     )
+
+def format_signal_detail(r):
+    t = r.get("expected_target") or {}
+    status = r.get("status")
+
+    if r.get("market_type") == "HK_STOCK":
+        structure_lines = (
+            f"日K戰略：{r.get('1d_strategy')}\n"
+            f"1H波段：{r.get('1h_wave')}\n"
+            f"15m進場：{r.get('15m_entry')}\n"
+        )
+    else:
+        structure_lines = (
+            f"日K soft：{r.get('1d_soft')}\n"
+            f"日K確認：{r.get('1d_confirm')}\n"
+            f"4H結構：{r.get('4h_structure')}\n"
+            f"4H量能：{r.get('4h_relaxed_volume')}\n"
+            f"1H進場：{r.get('1h_entry')}\n"
+            f"15m進場：{r.get('15m_entry')}\n"
+        )
+
+    return (
+        f"狀態：{status}\n"
+        f"現價：{price_text(r.get('latest_close'))}\n"
+        f"目標基準：{price_text(t.get('target_base'))} "
+        f"({pct_text(t.get('expected_base_pct'))})\n"
+        f"目標上緣：{price_text(t.get('target_high'))} "
+        f"({pct_text(t.get('expected_high_pct'))})\n"
+        f"最近支撐：{price_text(t.get('nearest_support'))}\n"
+        f"最近壓力：{price_text(t.get('nearest_resistance'))}\n"
+        f"{structure_lines}"
+    )
+
+
+def notify_early_signal(r):
+    send_ntfy(
+        f"2560 {r.get('status')} {r['base']}",
+        f"{r['base']} 2560 訊號\n\n{format_signal_detail(r)}",
+        "default",
+        "chart_with_upwards_trend",
+    )
+
 
 def notify_pre_strict(r):
     g = r.get("grid")
@@ -1608,6 +1694,13 @@ def notify_status_change(r, state):
     old_status = st.get("status")
     new_status = r["status"]
 
+    # WATCH / TREND_READY：只在狀態剛進入時通知一次，附完整現價/目標/結構。
+    if (
+        new_status in ("WATCH", "TREND_READY")
+        and old_status != new_status
+    ):
+        notify_early_signal(r)
+
     # PRE-STRICT 第一次進入時，鎖第一網參考價
     if new_status == "PRE-STRICT" and old_status != "PRE-STRICT":
         st["pre_strict_entry_price"] = r.get("latest_close")
@@ -1629,7 +1722,7 @@ def notify_status_change(r, state):
 # ============================================================
 
 def main():
-    print("2560 Cloud Monitor | FINAL 2026-09-28 HK FIX")
+    print("2560 Cloud Monitor | FINAL 2026-09-28 SIGNAL DETAIL")
     print("UTC:", now_iso())
     print(
         "Rule: NO_SIGNAL -> WATCH -> TREND_READY -> "
@@ -1695,20 +1788,32 @@ def main():
                     f" survive={g.get('survival_pass')}"
                 )
 
-            print(
-                f"{base:<5} "
-                f"{r['status']:<12} "
-                f"close={price_text(r['latest_close'])} "
-                f"4Hstruct={r['4h_structure']} "
-                f"relVol={r['4h_relaxed_volume']} "
-                f"4Hcore={r['4h_core']} "
-                f"1Dsoft={r['1d_soft']} "
-                f"1D={r['1d_confirm']} "
-                f"hist={r.get('history_mode')} "
-                f"bars4H={r.get('history_4h_bars')} "
-                f"bars1D={r.get('history_1d_bars')}"
-                f"{grid_text}"
-            )
+            if r["status"] == "NO_SIGNAL":
+                print(
+                    f"{base:<5} NO_SIGNAL    "
+                    f"close={price_text(r['latest_close'])} "
+                    f"hist={r.get('history_mode')}"
+                )
+            else:
+                t = r.get("expected_target") or {}
+                print(
+                    f"{base:<5} "
+                    f"{r['status']:<12} "
+                    f"now={price_text(r['latest_close'])} "
+                    f"target={price_text(t.get('target_base'))}"
+                    f"~{price_text(t.get('target_high'))} "
+                    f"space={pct_text(t.get('expected_base_pct'))}"
+                    f"~{pct_text(t.get('expected_high_pct'))} "
+                    f"support={price_text(t.get('nearest_support'))} "
+                    f"resist={price_text(t.get('nearest_resistance'))} "
+                    f"1Dsoft={r['1d_soft']} "
+                    f"1D={r['1d_confirm']} "
+                    f"4H={r['4h_structure']} "
+                    f"1H={r.get('1h_entry')} "
+                    f"15m={r.get('15m_entry')} "
+                    f"hist={r.get('history_mode')}"
+                    f"{grid_text}"
+                )
 
             notify_status_change(r, state)
 
@@ -1737,11 +1842,26 @@ def main():
             if r.get("status") == "WAIT_HISTORY":
                 print(f"{base:<12} WAIT_HISTORY 1D={r.get('history_1d_bars')} 1H={r.get('history_1h_bars')} 15m={r.get('history_15m_bars')}")
             else:
-                print(
-                    f"{base:<12} {r['status']:<12} close={price_text(r.get('latest_close'))} "
-                    f"1D={r.get('1d_strategy')} 1H={r.get('1h_wave')} 15m={r.get('15m_entry')} "
-                    f"target={price_text((r.get('expected_target') or {}).get('target_base'))}~{price_text((r.get('expected_target') or {}).get('target_high'))}"
-                )
+                if r["status"] == "NO_SIGNAL":
+                    print(
+                        f"{base:<12} NO_SIGNAL    "
+                        f"close={price_text(r.get('latest_close'))}"
+                    )
+                else:
+                    t = r.get("expected_target") or {}
+                    print(
+                        f"{base:<12} {r['status']:<12} "
+                        f"now={price_text(r.get('latest_close'))} "
+                        f"target={price_text(t.get('target_base'))}"
+                        f"~{price_text(t.get('target_high'))} "
+                        f"space={pct_text(t.get('expected_base_pct'))}"
+                        f"~{pct_text(t.get('expected_high_pct'))} "
+                        f"support={price_text(t.get('nearest_support'))} "
+                        f"resist={price_text(t.get('nearest_resistance'))} "
+                        f"1D={r.get('1d_strategy')} "
+                        f"1H={r.get('1h_wave')} "
+                        f"15m={r.get('15m_entry')}"
+                    )
             notify_status_change(r,state)
         except Exception as e:
             errors.append((base,str(e)))
@@ -1753,7 +1873,7 @@ def main():
         json.dumps(
             {
                 "generated_utc": now_iso(),
-                "rule_version": "2560_FINAL_2026_09_28_HK_PAGINATION_FIX",
+                "rule_version": "2560_FINAL_2026_09_28_SIGNAL_DETAIL",
                 "results": results,
             },
             ensure_ascii=False,
